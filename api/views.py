@@ -182,9 +182,13 @@ def admin_image_upload_view(request):
         return Response({"error": "Cloudinary rechazo la imagen."}, status=status.HTTP_502_BAD_GATEWAY)
 
     data = response.json()
+    secure_url = data.get("secure_url")
+    if not secure_url:
+        return Response({"error": "Cloudinary no devolvio una URL valida."}, status=status.HTTP_502_BAD_GATEWAY)
+
     return Response(
         {
-            "url": data.get("secure_url"),
+            "url": secure_url,
             "publicId": data.get("public_id"),
         }
     )
