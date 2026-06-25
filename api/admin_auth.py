@@ -42,6 +42,11 @@ def create_admin_token(username):
 def get_admin_from_request(request):
     token = request.COOKIES.get(ADMIN_COOKIE_NAME)
     if not token:
+        authorization = request.headers.get("Authorization", "")
+        if authorization.lower().startswith("bearer "):
+            token = authorization[7:].strip()
+
+    if not token:
         return None
 
     try:

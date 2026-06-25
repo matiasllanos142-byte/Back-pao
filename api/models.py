@@ -71,6 +71,23 @@ class Product(models.Model):
         return self.title
 
 
+class CloudinarySettings(models.Model):
+    id = models.CharField(primary_key=True, max_length=50, default="cloudinary")
+    cloud_name = models.CharField(max_length=200)
+    api_key = models.CharField(max_length=200)
+    api_secret_encrypted = models.TextField()
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "cloudinary_settings"
+        verbose_name = "Cloudinary settings"
+        verbose_name_plural = "Cloudinary settings"
+
+    def __str__(self):
+        return self.cloud_name
+
+
 class PurchasedProduct(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     user = models.ForeignKey(
