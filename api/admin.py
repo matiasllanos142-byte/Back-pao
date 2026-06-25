@@ -1,6 +1,6 @@
 from django.contrib import admin
 from django.contrib.auth.admin import UserAdmin as BaseUserAdmin
-from .models import User, Category, Product, Order, OrderItem
+from .models import User, Category, Product, Order, OrderItem, CloudinarySettings
 
 
 @admin.register(User)
@@ -34,6 +34,12 @@ class ProductAdmin(admin.ModelAdmin):
     list_display = ["title", "category", "price", "featured", "is_active", "created_at"]
     list_filter = ["category", "featured", "is_active", "level"]
     search_fields = ["title", "description"]
+
+
+@admin.register(CloudinarySettings)
+class CloudinarySettingsAdmin(admin.ModelAdmin):
+    list_display = ["cloud_name", "api_key", "updated_at"]
+    readonly_fields = ["created_at", "updated_at"]
 
 
 class OrderItemInline(admin.TabularInline):

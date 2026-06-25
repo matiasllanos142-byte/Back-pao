@@ -1,6 +1,7 @@
 import os
 import hashlib
 import time
+import base64
 from decimal import Decimal
 from rest_framework import status, generics
 from rest_framework.decorators import api_view, parser_classes, permission_classes
@@ -36,6 +37,12 @@ from .admin_auth import (
     verify_admin_credentials,
 )
 from .email_service import EmailDeliveryError, read_email_verification_token, send_verification_email
+from .cloudinary_settings import (
+    get_cloudinary_credentials,
+    resolve_cloudinary_credentials,
+    safe_cloudinary_settings,
+    save_cloudinary_settings,
+)
 
 User = get_user_model()
 
@@ -189,7 +196,14 @@ def admin_login_view(request):
         )
 
     token = create_admin_token(username)
-    response = Response({"admin": {"username": username}, "adminToken": token})
+    response = Response(
+        {
+            "admin": {"username": username},
+            "adminToken": token,
+            "token": token,
+            "accessToken": token,
+        }
+    )
     return set_admin_cookie(response, token)
 
 
@@ -207,13 +221,86 @@ def admin_me_view(request):
     return Response({"admin": admin})
 
 
-def sign_cloudinary_upload(params):
+def sign_cloudinary_upload(params, api_secret):
     payload = "&".join(
         f"{key}={value}"
         for key, value in sorted(params.items())
         if value not in [None, ""]
     )
-    return hashlib.sha1(f"{payload}{settings.CLOUDINARY_API_SECRET}".encode("utf-8")).hexdigest()
+    return hashlib.sha1(f"{payload}{api_secret}".encode("utf-8")).hexdigest()
+
+
+def cloudinary_error(response, fallback):
+    try:
+        data = response.json()
+        message = data.get("error", {}).get("message")
+        return message or fallback
+    except ValueError:
+        return fallback
+
+
+@api_view(["GET", "PUT"])
+@permission_classes([IsEnvAdmin])
+def admin_cloudinary_settings_view(request):
+    if request.method == "GET":
+        return Response({"cloudinary": safe_cloudinary_settings()})
+
+    cloud_name = request.data.get("cloudName", "").strip()
+    api_key = request.data.get("apiKey", "").strip()
+    api_secret = request.data.get("apiSecret", "").strip()
+
+    if not cloud_name or not api_key:
+        return Response(
+            {"error": "Cloud name y API key son obligatorios."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    try:
+        instance = save_cloudinary_settings(
+            cloud_name=cloud_name,
+            api_key=api_key,
+            api_secret=api_secret or None,
+        )
+    except ValueError as exc:
+        return Response({"error": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+    return Response({"cloudinary": safe_cloudinary_settings(instance)})
+
+
+@api_view(["POST"])
+@permission_classes([IsEnvAdmin])
+def admin_cloudinary_settings_test_view(request):
+    credentials = resolve_cloudinary_credentials(request.data)
+    if not credentials:
+        return Response(
+            {"error": "Completa las credenciales de Cloudinary."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    auth = base64.b64encode(
+        f"{credentials['api_key']}:{credentials['api_secret']}".encode("utf-8")
+    ).decode("ascii")
+    usage_url = f"https://api.cloudinary.com/v1_1/{credentials['cloud_name']}/usage"
+
+    try:
+        response = requests.get(
+            usage_url,
+            headers={"Authorization": f"Basic {auth}"},
+            timeout=20,
+        )
+    except requests.RequestException:
+        return Response(
+            {"error": "No se pudo validar Cloudinary."},
+            status=status.HTTP_502_BAD_GATEWAY,
+        )
+
+    if response.status_code >= 400:
+        return Response(
+            {"error": cloudinary_error(response, "Cloudinary rechazo las credenciales.")},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    return Response({"ok": True})
 
 
 def grant_order_access(order):
@@ -245,23 +332,27 @@ def admin_image_upload_view(request):
     if image.size > settings.CLOUDINARY_MAX_UPLOAD_BYTES:
         return Response({"error": "La imagen supera el tamano maximo permitido."}, status=status.HTTP_400_BAD_REQUEST)
 
-    if not all([settings.CLOUDINARY_CLOUD_NAME, settings.CLOUDINARY_API_KEY, settings.CLOUDINARY_API_SECRET]):
-        return Response({"error": "Cloudinary no esta configurado."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    credentials = get_cloudinary_credentials()
+    if not credentials:
+        return Response(
+            {"error": "Configura Cloudinary en Ajustes antes de subir imagenes."},
+            status=status.HTTP_409_CONFLICT,
+        )
 
     timestamp = int(time.time())
     upload_params = {
         "timestamp": timestamp,
         "folder": settings.CLOUDINARY_UPLOAD_FOLDER,
     }
-    signature = sign_cloudinary_upload(upload_params)
-    upload_url = f"https://api.cloudinary.com/v1_1/{settings.CLOUDINARY_CLOUD_NAME}/image/upload"
+    signature = sign_cloudinary_upload(upload_params, credentials["api_secret"])
+    upload_url = f"https://api.cloudinary.com/v1_1/{credentials['cloud_name']}/image/upload"
 
     try:
         response = requests.post(
             upload_url,
             data={
                 **{key: value for key, value in upload_params.items() if value},
-                "api_key": settings.CLOUDINARY_API_KEY,
+                "api_key": credentials["api_key"],
                 "signature": signature,
             },
             files={"file": (image.name, image.file, image.content_type)},
@@ -271,7 +362,10 @@ def admin_image_upload_view(request):
         return Response({"error": "No se pudo subir la imagen."}, status=status.HTTP_502_BAD_GATEWAY)
 
     if response.status_code >= 400:
-        return Response({"error": "Cloudinary rechazo la imagen."}, status=status.HTTP_502_BAD_GATEWAY)
+        return Response(
+            {"error": cloudinary_error(response, "Cloudinary rechazo la imagen.")},
+            status=status.HTTP_502_BAD_GATEWAY,
+        )
 
     data = response.json()
     secure_url = data.get("secure_url")
@@ -309,23 +403,27 @@ def admin_download_upload_view(request):
     if file.size > settings.CLOUDINARY_MAX_DOWNLOAD_BYTES:
         return Response({"error": "El archivo supera el tamano maximo permitido."}, status=status.HTTP_400_BAD_REQUEST)
 
-    if not all([settings.CLOUDINARY_CLOUD_NAME, settings.CLOUDINARY_API_KEY, settings.CLOUDINARY_API_SECRET]):
-        return Response({"error": "Cloudinary no esta configurado."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    credentials = get_cloudinary_credentials()
+    if not credentials:
+        return Response(
+            {"error": "Configura Cloudinary en Ajustes antes de subir archivos."},
+            status=status.HTTP_409_CONFLICT,
+        )
 
     timestamp = int(time.time())
     upload_params = {
         "timestamp": timestamp,
         "folder": settings.CLOUDINARY_DOWNLOAD_FOLDER,
     }
-    signature = sign_cloudinary_upload(upload_params)
-    upload_url = f"https://api.cloudinary.com/v1_1/{settings.CLOUDINARY_CLOUD_NAME}/raw/upload"
+    signature = sign_cloudinary_upload(upload_params, credentials["api_secret"])
+    upload_url = f"https://api.cloudinary.com/v1_1/{credentials['cloud_name']}/raw/upload"
 
     try:
         response = requests.post(
             upload_url,
             data={
                 **{key: value for key, value in upload_params.items() if value},
-                "api_key": settings.CLOUDINARY_API_KEY,
+                "api_key": credentials["api_key"],
                 "signature": signature,
             },
             files={"file": (file.name, file.file, file.content_type)},
@@ -335,7 +433,10 @@ def admin_download_upload_view(request):
         return Response({"error": "No se pudo subir el archivo."}, status=status.HTTP_502_BAD_GATEWAY)
 
     if response.status_code >= 400:
-        return Response({"error": "Cloudinary rechazo el archivo."}, status=status.HTTP_502_BAD_GATEWAY)
+        return Response(
+            {"error": cloudinary_error(response, "Cloudinary rechazo el archivo.")},
+            status=status.HTTP_502_BAD_GATEWAY,
+        )
 
     data = response.json()
     secure_url = data.get("secure_url")
