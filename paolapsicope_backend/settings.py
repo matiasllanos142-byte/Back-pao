@@ -36,6 +36,8 @@ CLOUDINARY_API_KEY = os.environ.get("CLOUDINARY_API_KEY", "")
 CLOUDINARY_API_SECRET = os.environ.get("CLOUDINARY_API_SECRET", "")
 CLOUDINARY_UPLOAD_FOLDER = os.environ.get("CLOUDINARY_UPLOAD_FOLDER", "paola-psicope/products")
 CLOUDINARY_MAX_UPLOAD_BYTES = int(os.environ.get("CLOUDINARY_MAX_UPLOAD_BYTES", str(5 * 1024 * 1024)))
+CLOUDINARY_DOWNLOAD_FOLDER = os.environ.get("CLOUDINARY_DOWNLOAD_FOLDER", "paola-psicope/downloads")
+CLOUDINARY_MAX_DOWNLOAD_BYTES = int(os.environ.get("CLOUDINARY_MAX_DOWNLOAD_BYTES", str(25 * 1024 * 1024)))
 
 BACKEND_PUBLIC_URL = os.environ.get("BACKEND_PUBLIC_URL", "").rstrip("/")
 RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
@@ -47,6 +49,9 @@ EMAIL_VERIFICATION_TOKEN_TTL_SECONDS = int(
 )
 EMAIL_VERIFICATION_SUCCESS_URL = os.environ.get("EMAIL_VERIFICATION_SUCCESS_URL", "")
 EMAIL_VERIFICATION_ERROR_URL = os.environ.get("EMAIL_VERIFICATION_ERROR_URL", "")
+MP_ACCESS_TOKEN = os.environ.get("MP_ACCESS_TOKEN", "")
+MP_WEBHOOK_SECRET = os.environ.get("MP_WEBHOOK_SECRET", "")
+FRONTEND_URL = os.environ.get("FRONTEND_URL", "http://localhost:3000").rstrip("/")
 
 INSTALLED_APPS = [
     "django.contrib.admin",

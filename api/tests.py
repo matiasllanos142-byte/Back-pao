@@ -4,7 +4,7 @@ from django.core.files.uploadedfile import SimpleUploadedFile
 from unittest.mock import Mock, patch
 from rest_framework.test import APIClient
 
-from .models import Category, User
+from .models import Category, Product, PurchasedProduct, User
 from .email_service import make_email_verification_token
 
 
@@ -28,6 +28,8 @@ from .email_service import make_email_verification_token
     EMAIL_VERIFICATION_TOKEN_TTL_SECONDS=86400,
     EMAIL_VERIFICATION_SUCCESS_URL="",
     EMAIL_VERIFICATION_ERROR_URL="",
+    MP_ACCESS_TOKEN="",
+    FRONTEND_URL="http://localhost:3000",
 )
 class AdminAuthTests(TestCase):
     def setUp(self):
@@ -201,3 +203,97 @@ class AdminAuthTests(TestCase):
         user.refresh_from_db()
         self.assertTrue(user.email_verified)
         self.assertIsNotNone(user.email_verified_at)
+
+    def test_payment_requires_user_session(self):
+        product = Product.objects.create(
+            title="Recurso privado",
+            description="Material descargable.",
+            price="1500.00",
+            category_id="estimulacion",
+            image="/images/products/default.jpg",
+            age="6-8 anos",
+            level="Inicial",
+            features=[],
+            objectives=[],
+        )
+
+        response = self.client.post(
+            "/api/payments/create-preference",
+            {
+                "items": [{"productId": str(product.id), "quantity": 1}],
+                "customer": {"name": "Invitado", "email": "invitado@test.com"},
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 401)
+
+    def test_completed_payment_grants_library_download_access(self):
+        product = Product.objects.create(
+            title="Cuadernillo descargable",
+            description="Material descargable.",
+            price="1500.00",
+            category_id="estimulacion",
+            image="/images/products/default.jpg",
+            download_url="https://res.cloudinary.com/demo/raw/upload/cuadernillo.pdf",
+            download_filename="cuadernillo.pdf",
+            age="6-8 anos",
+            level="Inicial",
+            features=[],
+            objectives=[],
+        )
+        register_response = self.client.post(
+            "/api/auth/register",
+            {"name": "Cliente", "email": "cliente-biblioteca@test.com", "password": "cliente123"},
+            format="json",
+        )
+        self.assertEqual(register_response.status_code, 201)
+
+        payment_response = self.client.post(
+            "/api/payments/create-preference",
+            {
+                "items": [{"productId": str(product.id), "quantity": 1}],
+                "customer": {"name": "Cliente", "email": "otro-email@test.com"},
+            },
+            format="json",
+        )
+
+        self.assertEqual(payment_response.status_code, 200)
+        self.assertTrue(payment_response.data["demo"])
+        self.assertTrue(
+            PurchasedProduct.objects.filter(
+                user__email="cliente-biblioteca@test.com",
+                product=product,
+                is_active=True,
+            ).exists()
+        )
+
+        library_response = self.client.get("/api/library")
+        self.assertEqual(library_response.status_code, 200)
+        self.assertEqual(len(library_response.data["items"]), 1)
+        self.assertEqual(library_response.data["items"][0]["downloadFileName"], "cuadernillo.pdf")
+
+        download_response = self.client.get(f"/api/library/products/{product.id}/download")
+        self.assertEqual(download_response.status_code, 200)
+        self.assertEqual(download_response.data["downloadUrl"], product.download_url)
+
+    def test_public_product_detail_does_not_expose_download_url(self):
+        product = Product.objects.create(
+            title="Recurso publico",
+            description="Material descargable.",
+            price="1500.00",
+            category_id="estimulacion",
+            image="/images/products/default.jpg",
+            download_url="https://res.cloudinary.com/demo/raw/upload/privado.pdf",
+            download_filename="privado.pdf",
+            age="6-8 anos",
+            level="Inicial",
+            features=[],
+            objectives=[],
+        )
+
+        response = self.client.get(f"/api/products/{product.id}")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertNotIn("download_url", response.data)
+        self.assertNotIn("downloadUrl", response.data)

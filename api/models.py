@@ -52,6 +52,8 @@ class Product(models.Model):
         Category, on_delete=models.PROTECT, related_name="products", db_column="category_slug"
     )
     image = models.CharField(max_length=500, default="/images/products/placeholder.jpg")
+    download_url = models.URLField(max_length=1000, blank=True)
+    download_filename = models.CharField(max_length=300, blank=True)
     badge = models.CharField(max_length=100, blank=True, null=True)
     featured = models.BooleanField(default=False)
     age = models.CharField(max_length=100)
@@ -67,6 +69,34 @@ class Product(models.Model):
 
     def __str__(self):
         return self.title
+
+
+class PurchasedProduct(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    user = models.ForeignKey(
+        User, on_delete=models.CASCADE, related_name="purchased_products"
+    )
+    product = models.ForeignKey(
+        Product, on_delete=models.PROTECT, related_name="purchases"
+    )
+    order = models.ForeignKey(
+        "Order", on_delete=models.SET_NULL, null=True, blank=True, related_name="accesses"
+    )
+    is_active = models.BooleanField(default=True)
+    acquired_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "purchased_products"
+        constraints = [
+            models.UniqueConstraint(
+                fields=["user", "product"],
+                name="unique_active_product_access_per_user",
+            )
+        ]
+
+    def __str__(self):
+        return f"{self.user.email} -> {self.product.title}"
 
 
 class Order(models.Model):

@@ -1,7 +1,7 @@
 from rest_framework import serializers
 from django.contrib.auth import get_user_model
 from django.contrib.auth.hashers import make_password
-from .models import Category, Product, Order, OrderItem
+from .models import Category, Product, Order, OrderItem, PurchasedProduct
 
 User = get_user_model()
 
@@ -67,6 +67,8 @@ class ProductSerializer(serializers.ModelSerializer):
             "price",
             "category",
             "image",
+            "download_url",
+            "download_filename",
             "badge",
             "featured",
             "age",
@@ -98,6 +100,27 @@ class ProductListSerializer(serializers.ModelSerializer):
             "features",
             "objectives",
             "created_at",
+        ]
+
+
+class PurchasedProductSerializer(serializers.ModelSerializer):
+    product = ProductListSerializer(read_only=True)
+    downloadUrl = serializers.CharField(source="product.download_url", read_only=True)
+    downloadFileName = serializers.CharField(
+        source="product.download_filename", read_only=True
+    )
+    acquiredAt = serializers.DateTimeField(source="acquired_at", read_only=True)
+    orderId = serializers.UUIDField(source="order_id", read_only=True)
+
+    class Meta:
+        model = PurchasedProduct
+        fields = [
+            "id",
+            "product",
+            "downloadUrl",
+            "downloadFileName",
+            "acquiredAt",
+            "orderId",
         ]
 
 

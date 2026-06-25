@@ -16,13 +16,14 @@ from django.shortcuts import get_object_or_404
 from django.conf import settings
 import requests
 
-from .models import Category, Product, Order, OrderItem
+from .models import Category, Product, Order, OrderItem, PurchasedProduct
 from .serializers import (
     UserSerializer,
     RegisterSerializer,
     CategorySerializer,
     ProductSerializer,
     ProductListSerializer,
+    PurchasedProductSerializer,
     OrderSerializer,
 )
 from .permissions import IsAdmin
@@ -197,6 +198,21 @@ def sign_cloudinary_upload(params):
     return hashlib.sha1(f"{payload}{settings.CLOUDINARY_API_SECRET}".encode("utf-8")).hexdigest()
 
 
+def grant_order_access(order):
+    if not order.user_id or order.status != "completada":
+        return
+
+    for item in order.items.select_related("product"):
+        PurchasedProduct.objects.update_or_create(
+            user=order.user,
+            product=item.product,
+            defaults={
+                "order": order,
+                "is_active": True,
+            },
+        )
+
+
 @api_view(["POST"])
 @permission_classes([IsEnvAdmin])
 @parser_classes([MultiPartParser, FormParser])
@@ -252,6 +268,71 @@ def admin_image_upload_view(request):
     )
 
 
+@api_view(["POST"])
+@permission_classes([IsEnvAdmin])
+@parser_classes([MultiPartParser, FormParser])
+def admin_download_upload_view(request):
+    file = request.FILES.get("file")
+    if not file:
+        return Response({"error": "Falta el archivo."}, status=status.HTTP_400_BAD_REQUEST)
+
+    allowed_types = {
+        "application/pdf",
+        "application/zip",
+        "application/x-zip-compressed",
+        "application/octet-stream",
+    }
+    if file.content_type not in allowed_types:
+        return Response(
+            {"error": "El archivo debe ser PDF o ZIP."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    if file.size > settings.CLOUDINARY_MAX_DOWNLOAD_BYTES:
+        return Response({"error": "El archivo supera el tamano maximo permitido."}, status=status.HTTP_400_BAD_REQUEST)
+
+    if not all([settings.CLOUDINARY_CLOUD_NAME, settings.CLOUDINARY_API_KEY, settings.CLOUDINARY_API_SECRET]):
+        return Response({"error": "Cloudinary no esta configurado."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+    timestamp = int(time.time())
+    upload_params = {
+        "timestamp": timestamp,
+        "folder": settings.CLOUDINARY_DOWNLOAD_FOLDER,
+    }
+    signature = sign_cloudinary_upload(upload_params)
+    upload_url = f"https://api.cloudinary.com/v1_1/{settings.CLOUDINARY_CLOUD_NAME}/raw/upload"
+
+    try:
+        response = requests.post(
+            upload_url,
+            data={
+                **{key: value for key, value in upload_params.items() if value},
+                "api_key": settings.CLOUDINARY_API_KEY,
+                "signature": signature,
+            },
+            files={"file": (file.name, file.file, file.content_type)},
+            timeout=60,
+        )
+    except requests.RequestException:
+        return Response({"error": "No se pudo subir el archivo."}, status=status.HTTP_502_BAD_GATEWAY)
+
+    if response.status_code >= 400:
+        return Response({"error": "Cloudinary rechazo el archivo."}, status=status.HTTP_502_BAD_GATEWAY)
+
+    data = response.json()
+    secure_url = data.get("secure_url")
+    if not secure_url:
+        return Response({"error": "Cloudinary no devolvio una URL valida."}, status=status.HTTP_502_BAD_GATEWAY)
+
+    return Response(
+        {
+            "url": secure_url,
+            "fileName": file.name,
+            "publicId": data.get("public_id"),
+        }
+    )
+
+
 class ProductListCreateView(generics.ListCreateAPIView):
     queryset = Product.objects.filter(is_active=True).order_by("-created_at")
 
@@ -270,6 +351,11 @@ class ProductDetailUpdateDestroyView(generics.RetrieveUpdateDestroyAPIView):
     queryset = Product.objects.filter(is_active=True)
     serializer_class = ProductSerializer
     lookup_field = "pk"
+
+    def get_serializer_class(self):
+        if self.request.method == "GET":
+            return ProductListSerializer
+        return ProductSerializer
 
     def get_permissions(self):
         if self.request.method in ["PUT", "PATCH", "DELETE"]:
@@ -301,6 +387,41 @@ def admin_order_list_view(request):
     orders = Order.objects.all().order_by("-created_at")[:100]
     serializer = OrderSerializer(orders, many=True)
     return Response({"orders": serializer.data})
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def library_view(request):
+    purchases = (
+        PurchasedProduct.objects.filter(user=request.user, is_active=True)
+        .select_related("product", "order", "product__category")
+        .order_by("-acquired_at")
+    )
+    serializer = PurchasedProductSerializer(purchases, many=True)
+    return Response({"items": serializer.data})
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def library_download_view(request, pk):
+    purchase = get_object_or_404(
+        PurchasedProduct.objects.select_related("product"),
+        user=request.user,
+        product_id=pk,
+        is_active=True,
+    )
+    if not purchase.product.download_url:
+        return Response(
+            {"error": "Este producto todavia no tiene archivo descargable."},
+            status=status.HTTP_404_NOT_FOUND,
+        )
+
+    return Response(
+        {
+            "downloadUrl": purchase.product.download_url,
+            "downloadFileName": purchase.product.download_filename,
+        }
+    )
 
 
 @api_view(["GET", "POST"])
@@ -340,14 +461,12 @@ def order_detail_view(request, pk):
 
 
 @api_view(["POST"])
-@permission_classes([AllowAny])
+@permission_classes([IsAuthenticated])
 def create_payment_preference_view(request):
-    from mercadopago import MercadoPagoConfig, Preference
-
     items_data = request.data.get("items", [])
     customer = request.data.get("customer", {})
-    customer_name = customer.get("name", "").strip()
-    customer_email = customer.get("email", "").lower().strip()
+    customer_name = customer.get("name", "").strip() or request.user.first_name
+    customer_email = request.user.email.lower().strip()
 
     if not items_data or not customer_name or not customer_email:
         return Response({"error": "Datos incompletos."}, status=status.HTTP_400_BAD_REQUEST)
@@ -366,12 +485,15 @@ def create_payment_preference_view(request):
     total = sum(item["product"].price * item["quantity"] for item in order_items)
 
     order = Order.objects.create(
-        user=request.user if request.user.is_authenticated else None,
+        user=request.user,
         total=total,
-        status="completada" if not os.environ.get("MP_ACCESS_TOKEN") else "pendiente",
+        status="completada" if not settings.MP_ACCESS_TOKEN else "pendiente",
         customer_name=customer_name,
         customer_email=customer_email,
+        external_reference="",
     )
+    order.external_reference = str(order.id)
+    order.save(update_fields=["external_reference", "updated_at"])
 
     for item in order_items:
         OrderItem.objects.create(
@@ -381,19 +503,20 @@ def create_payment_preference_view(request):
             price=item["product"].price,
         )
 
-    base_url = os.environ.get("FRONTEND_URL", "http://localhost:3000")
+    base_url = settings.FRONTEND_URL
 
-    if not os.environ.get("MP_ACCESS_TOKEN"):
+    if not settings.MP_ACCESS_TOKEN:
+        grant_order_access(order)
         return Response({
             "demo": True,
             "orderId": str(order.id),
             "init_point": f"{base_url}/checkout/success?order_id={order.id}",
         })
 
-    client = MercadoPagoConfig(access_token=os.environ.get("MP_ACCESS_TOKEN"))
-    preference = Preference(client)
+    import mercadopago
 
-    result = preference.create({
+    sdk = mercadopago.SDK(settings.MP_ACCESS_TOKEN)
+    result = sdk.preference().create({
         "body": {
             "items": [
                 {
@@ -416,7 +539,15 @@ def create_payment_preference_view(request):
         }
     })
 
-    return Response({"init_point": result["init_point"], "orderId": str(order.id)})
+    response_body = result.get("response", {})
+    init_point = response_body.get("init_point")
+    if not init_point:
+        return Response(
+            {"error": "Mercado Pago no devolvio un link de pago."},
+            status=status.HTTP_502_BAD_GATEWAY,
+        )
+
+    return Response({"init_point": init_point, "orderId": str(order.id)})
 
 
 @api_view(["POST"])
@@ -434,7 +565,8 @@ def payment_webhook_view(request):
                 order = Order.objects.get(id=order_id)
                 order.status = "completada"
                 order.payment_id = str(payment_data.get("id"))
-                order.save()
+                order.save(update_fields=["status", "payment_id", "updated_at"])
+                grant_order_access(order)
             except Order.DoesNotExist:
                 pass
 
