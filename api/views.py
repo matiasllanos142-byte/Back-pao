@@ -19,6 +19,14 @@ from .serializers import (
     OrderSerializer,
 )
 from .permissions import IsAdmin
+from .permissions import IsEnvAdmin
+from .admin_auth import (
+    clear_admin_cookie,
+    create_admin_token,
+    get_admin_from_request,
+    set_admin_cookie,
+    verify_admin_credentials,
+)
 
 User = get_user_model()
 
@@ -28,13 +36,12 @@ COOKIE_MAX_AGE = 60 * 60 * 24 * 7  # 7 días
 
 def set_auth_cookie(response, user):
     token = AccessToken.for_user(user)
-    is_secure = not settings.DEBUG
     response.set_cookie(
         COOKIE_NAME,
         str(token),
         httponly=True,
-        secure=is_secure,
-        samesite="Lax",
+        secure=settings.AUTH_COOKIE_SECURE,
+        samesite=settings.AUTH_COOKIE_SAMESITE,
         max_age=COOKIE_MAX_AGE,
     )
     return response
@@ -53,7 +60,7 @@ def register_view(request):
         return Response({"error": serializer.errors}, status=status.HTTP_400_BAD_REQUEST)
 
     user = serializer.save()
-    response = Response(UserSerializer(user).data, status=status.HTTP_201_CREATED)
+    response = Response({"user": UserSerializer(user).data}, status=status.HTTP_201_CREATED)
     return set_auth_cookie(response, user)
 
 
@@ -71,7 +78,7 @@ def login_view(request):
     if not user.check_password(password):
         return Response({"error": "Email o contraseña incorrectos."}, status=status.HTTP_401_UNAUTHORIZED)
 
-    response = Response(UserSerializer(user).data)
+    response = Response({"user": UserSerializer(user).data})
     return set_auth_cookie(response, user)
 
 
@@ -88,6 +95,37 @@ def me_view(request):
     return Response({"user": None})
 
 
+@api_view(["POST"])
+@permission_classes([AllowAny])
+def admin_login_view(request):
+    username = request.data.get("username", "").strip()
+    password = request.data.get("password", "")
+
+    if not verify_admin_credentials(username, password):
+        return Response(
+            {"error": "Credenciales de administracion incorrectas."},
+            status=status.HTTP_401_UNAUTHORIZED,
+        )
+
+    token = create_admin_token(username)
+    response = Response({"admin": {"username": username}})
+    return set_admin_cookie(response, token)
+
+
+@api_view(["POST"])
+@permission_classes([AllowAny])
+def admin_logout_view(request):
+    response = Response({"ok": True})
+    return clear_admin_cookie(response)
+
+
+@api_view(["GET"])
+@permission_classes([AllowAny])
+def admin_me_view(request):
+    admin = get_admin_from_request(request)
+    return Response({"admin": admin})
+
+
 class ProductListCreateView(generics.ListCreateAPIView):
     queryset = Product.objects.filter(is_active=True).order_by("-created_at")
 
@@ -98,7 +136,7 @@ class ProductListCreateView(generics.ListCreateAPIView):
 
     def get_permissions(self):
         if self.request.method == "POST":
-            return [IsAdmin()]
+            return [IsEnvAdmin()]
         return [AllowAny()]
 
 
@@ -109,12 +147,34 @@ class ProductDetailUpdateDestroyView(generics.RetrieveUpdateDestroyAPIView):
 
     def get_permissions(self):
         if self.request.method in ["PUT", "PATCH", "DELETE"]:
-            return [IsAdmin()]
+            return [IsEnvAdmin()]
         return [AllowAny()]
 
     def perform_destroy(self, instance):
         instance.is_active = False
         instance.save()
+
+
+class AdminProductListCreateView(ProductListCreateView):
+    permission_classes = [IsEnvAdmin]
+
+    def get_permissions(self):
+        return [IsEnvAdmin()]
+
+
+class AdminProductDetailUpdateDestroyView(ProductDetailUpdateDestroyView):
+    permission_classes = [IsEnvAdmin]
+
+    def get_permissions(self):
+        return [IsEnvAdmin()]
+
+
+@api_view(["GET"])
+@permission_classes([IsEnvAdmin])
+def admin_order_list_view(request):
+    orders = Order.objects.all().order_by("-created_at")[:100]
+    serializer = OrderSerializer(orders, many=True)
+    return Response({"orders": serializer.data})
 
 
 @api_view(["GET", "POST"])

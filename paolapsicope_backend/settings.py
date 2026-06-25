@@ -20,6 +20,17 @@ DEBUG = os.environ.get("DEBUG", "False").lower() == "true"
 
 ALLOWED_HOSTS = os.environ.get("ALLOWED_HOSTS", "*").split(",")
 
+AUTH_COOKIE_SECURE = os.environ.get("AUTH_COOKIE_SECURE", str(not DEBUG)).lower() == "true"
+AUTH_COOKIE_SAMESITE = os.environ.get(
+    "AUTH_COOKIE_SAMESITE",
+    "Lax" if DEBUG else "None",
+)
+
+ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "admin")
+ADMIN_PASSWORD_HASH = os.environ.get("ADMIN_PASSWORD_HASH", "")
+ADMIN_JWT_SECRET = os.environ.get("ADMIN_JWT_SECRET", SECRET_KEY)
+ADMIN_TOKEN_TTL = int(os.environ.get("ADMIN_TOKEN_TTL", "86400"))
+
 INSTALLED_APPS = [
     "django.contrib.admin",
     "django.contrib.auth",
@@ -146,5 +157,5 @@ X_FRAME_OPTIONS = "DENY"
 
 if not DEBUG:
     SECURE_SSL_REDIRECT = os.environ.get("SECURE_SSL_REDIRECT", "True").lower() == "true"
-    SESSION_COOKIE_SECURE = True
-    CSRF_COOKIE_SECURE = True
+    SESSION_COOKIE_SECURE = AUTH_COOKIE_SECURE
+    CSRF_COOKIE_SECURE = AUTH_COOKIE_SECURE

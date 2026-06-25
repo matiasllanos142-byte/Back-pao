@@ -7,30 +7,40 @@ User = get_user_model()
 
 
 class UserSerializer(serializers.ModelSerializer):
+    name = serializers.CharField(source="first_name")
+    isAdmin = serializers.BooleanField(source="is_admin")
+    createdAt = serializers.DateTimeField(source="created_at")
+
     class Meta:
         model = User
-        fields = ["id", "email", "first_name", "is_admin", "created_at"]
+        fields = ["id", "name", "email", "isAdmin", "createdAt"]
 
 
 class RegisterSerializer(serializers.ModelSerializer):
+    name = serializers.CharField(write_only=True, required=False, allow_blank=False)
     password = serializers.CharField(write_only=True, min_length=6)
 
     class Meta:
         model = User
-        fields = ["first_name", "email", "password"]
+        fields = ["name", "first_name", "email", "password"]
+        extra_kwargs = {
+            "first_name": {"write_only": True, "required": False, "allow_blank": False}
+        }
+
+    def validate(self, attrs):
+        if not attrs.get("name") and not attrs.get("first_name"):
+            raise serializers.ValidationError({"name": "Este campo es requerido."})
+        return attrs
 
     def create(self, validated_data):
-        from django.conf import settings
-
         email = validated_data["email"].lower()
-        admin_email = getattr(settings, "ADMIN_EMAIL", "admin@paolapsicope.com")
-        is_admin = email == admin_email.lower()
+        first_name = validated_data.get("name") or validated_data.get("first_name", "")
 
         user = User.objects.create(
             username=email,
             email=email,
-            first_name=validated_data.get("first_name", ""),
-            is_admin=is_admin,
+            first_name=first_name,
+            is_admin=False,
             password=make_password(validated_data["password"]),
         )
         return user
