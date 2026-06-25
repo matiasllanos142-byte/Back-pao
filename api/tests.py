@@ -61,8 +61,48 @@ class AdminAuthTests(TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.data["admin"]["username"], "paola-admin")
+        self.assertIn("adminToken", response.data)
         self.assertIn("admin_session", response.cookies)
         self.assertNotIn("session", response.cookies)
+
+    def test_admin_bearer_token_can_access_admin_endpoints(self):
+        login_response = self.client.post(
+            "/api/admin/login",
+            {"username": "paola-admin", "password": "secreto-admin"},
+            format="json",
+        )
+        self.assertEqual(login_response.status_code, 200)
+        token = login_response.data["adminToken"]
+
+        self.client.cookies.clear()
+
+        me_response = self.client.get(
+            "/api/admin/me",
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+        self.assertEqual(me_response.status_code, 200)
+        self.assertEqual(me_response.data["admin"]["username"], "paola-admin")
+
+        response = self.client.post(
+            "/api/admin/products",
+            {
+                "title": "Producto bearer",
+                "description": "Creado con token bearer admin.",
+                "price": "3000.00",
+                "category": "estimulacion",
+                "image": "/images/products/default.jpg",
+                "featured": False,
+                "age": "6-8 anos",
+                "level": "Inicial",
+                "features": [],
+                "objectives": [],
+            },
+            format="json",
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.data["title"], "Producto bearer")
 
     def test_public_user_session_cannot_create_admin_product(self):
         register_response = self.client.post(
@@ -89,7 +129,38 @@ class AdminAuthTests(TestCase):
             format="json",
         )
 
-        self.assertEqual(response.status_code, 403)
+        self.assertEqual(response.status_code, 401)
+
+    def test_public_user_bearer_token_cannot_create_admin_product(self):
+        register_response = self.client.post(
+            "/api/auth/register",
+            {"name": "Cliente Token", "email": "cliente-token-admin@test.com", "password": "cliente123"},
+            format="json",
+        )
+        self.assertEqual(register_response.status_code, 201)
+        token = register_response.data["accessToken"]
+
+        self.client.cookies.clear()
+
+        response = self.client.post(
+            "/api/admin/products",
+            {
+                "title": "Producto bloqueado",
+                "description": "No deberia crearse con token publico.",
+                "price": "1000.00",
+                "category": "estimulacion",
+                "image": "/images/products/default.jpg",
+                "featured": False,
+                "age": "6-8 anos",
+                "level": "Inicial",
+                "features": [],
+                "objectives": [],
+            },
+            format="json",
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+
+        self.assertEqual(response.status_code, 401)
 
     def test_admin_cookie_can_create_product(self):
         login_response = self.client.post(

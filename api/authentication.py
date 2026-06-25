@@ -5,6 +5,9 @@ from rest_framework.exceptions import AuthenticationFailed
 
 class JWTCookieAuthentication(JWTAuthentication):
     def authenticate(self, request):
+        if request.path_info.startswith("/api/admin"):
+            return None
+
         header = self.get_header(request)
         if header is not None:
             raw_token = self.get_raw_token(header)

@@ -189,7 +189,7 @@ def admin_login_view(request):
         )
 
     token = create_admin_token(username)
-    response = Response({"admin": {"username": username}})
+    response = Response({"admin": {"username": username}, "adminToken": token})
     return set_admin_cookie(response, token)
 
 

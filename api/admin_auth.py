@@ -27,6 +27,14 @@ def verify_admin_credentials(username, password):
     return username == expected_username and check_password(password, password_hash)
 
 
+def _get_bearer_token(request):
+    authorization = request.headers.get("Authorization", "")
+    parts = authorization.split()
+    if len(parts) == 2 and parts[0].lower() == "bearer":
+        return parts[1]
+    return None
+
+
 def create_admin_token(username):
     now = datetime.now(timezone.utc)
     expires_at = now + timedelta(seconds=getattr(settings, "ADMIN_TOKEN_TTL", 86400))
@@ -40,7 +48,7 @@ def create_admin_token(username):
 
 
 def get_admin_from_request(request):
-    token = request.COOKIES.get(ADMIN_COOKIE_NAME)
+    token = request.COOKIES.get(ADMIN_COOKIE_NAME) or _get_bearer_token(request)
     if not token:
         return None
 
