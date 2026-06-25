@@ -49,6 +49,15 @@ railway variables --set "EMAIL_VERIFICATION_SUCCESS_URL=https://tu-frontend.verc
 railway variables --set "EMAIL_VERIFICATION_ERROR_URL=https://tu-frontend.vercel.app/login?verified=0"
 ```
 
+## Paso 4: migraciones
+
+Este cambio agrega columnas nuevas en la tabla de usuarios. Despues del deploy,
+si Railway no corre migraciones automaticamente, ejecuta:
+
+```powershell
+railway run python manage.py migrate
+```
+
 ## Variables relacionadas que ya deberia tener Railway
 
 ```text
