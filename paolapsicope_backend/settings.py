@@ -162,17 +162,20 @@ SIMPLE_JWT = {
     "AUTH_HEADER_TYPES": ("Bearer",),
 }
 
-DEFAULT_CORS_ALLOWED_ORIGINS = (
-    "http://localhost:3000,"
-    "http://127.0.0.1:3000,"
-    "https://paola-psicope.vercel.app"
-)
-
-CORS_ALLOWED_ORIGINS = [
+DEFAULT_CORS_ALLOWED_ORIGINS = [
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    "https://paola-psicope.vercel.app",
+]
+CONFIGURED_CORS_ALLOWED_ORIGINS = [
     origin.strip()
-    for origin in os.environ.get("CORS_ALLOWED_ORIGINS", DEFAULT_CORS_ALLOWED_ORIGINS).split(",")
+    for origin in os.environ.get("CORS_ALLOWED_ORIGINS", "").split(",")
     if origin.strip()
 ]
+
+CORS_ALLOWED_ORIGINS = list(
+    dict.fromkeys([*DEFAULT_CORS_ALLOWED_ORIGINS, *CONFIGURED_CORS_ALLOWED_ORIGINS])
+)
 
 CORS_ALLOW_CREDENTIALS = True
 
@@ -184,6 +187,8 @@ SECURE_CONTENT_TYPE_NOSNIFF = True
 X_FRAME_OPTIONS = "DENY"
 
 if not DEBUG:
+    SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
+    USE_X_FORWARDED_HOST = True
     SECURE_SSL_REDIRECT = os.environ.get("SECURE_SSL_REDIRECT", "True").lower() == "true"
     SESSION_COOKIE_SECURE = AUTH_COOKIE_SECURE
     CSRF_COOKIE_SECURE = AUTH_COOKIE_SECURE
