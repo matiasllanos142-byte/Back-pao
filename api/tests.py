@@ -4,7 +4,8 @@ from django.core.files.uploadedfile import SimpleUploadedFile
 from unittest.mock import Mock, patch
 from rest_framework.test import APIClient
 
-from .models import Category
+from .models import Category, User
+from .email_service import make_email_verification_token
 
 
 @override_settings(
@@ -20,6 +21,13 @@ from .models import Category
     CLOUDINARY_API_KEY="demo-key",
     CLOUDINARY_API_SECRET="demo-secret-with-at-least-32-bytes",
     CLOUDINARY_UPLOAD_FOLDER="tests/products",
+    BACKEND_PUBLIC_URL="https://backend.test",
+    RESEND_API_KEY="",
+    RESEND_FROM_EMAIL="Paola Psicopé <no-reply@example.com>",
+    RESEND_REPLY_TO="contacto@example.com",
+    EMAIL_VERIFICATION_TOKEN_TTL_SECONDS=86400,
+    EMAIL_VERIFICATION_SUCCESS_URL="",
+    EMAIL_VERIFICATION_ERROR_URL="",
 )
 class AdminAuthTests(TestCase):
     def setUp(self):
@@ -141,3 +149,55 @@ class AdminAuthTests(TestCase):
         self.assertEqual(response.data["url"], "https://res.cloudinary.com/demo/image/upload/sample.jpg")
         self.assertEqual(response.data["publicId"], "tests/products/sample")
         mocked_post.assert_called_once()
+
+    @override_settings(RESEND_API_KEY="re_test")
+    @patch("api.email_service.requests.post")
+    def test_register_sends_verification_email_with_resend(self, mocked_post):
+        mocked_response = Mock()
+        mocked_response.status_code = 200
+        mocked_response.json.return_value = {"id": "email_123"}
+        mocked_post.return_value = mocked_response
+
+        response = self.client.post(
+            "/api/auth/register",
+            {
+                "name": "Paola Cliente",
+                "email": "cliente@example.com",
+                "password": "cliente123",
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 201)
+        self.assertTrue(response.data["emailVerificationSent"])
+        self.assertFalse(response.data["user"]["emailVerified"])
+        mocked_post.assert_called_once()
+        payload = mocked_post.call_args.kwargs["json"]
+        headers = mocked_post.call_args.kwargs["headers"]
+        self.assertEqual(payload["to"], ["cliente@example.com"])
+        self.assertEqual(payload["from"], "Paola Psicopé <no-reply@example.com>")
+        self.assertIn("https://backend.test/api/auth/verify-email?token=", payload["html"])
+        self.assertEqual(headers["User-Agent"], "paola-psicope-backend/1.0")
+
+    def test_verify_email_marks_user_as_verified(self):
+        register_response = self.client.post(
+            "/api/auth/register",
+            {
+                "name": "Cliente Verificacion",
+                "email": "verifica@example.com",
+                "password": "cliente123",
+            },
+            format="json",
+        )
+        self.assertEqual(register_response.status_code, 201)
+
+        user = User.objects.get(email="verifica@example.com")
+        self.assertFalse(user.email_verified)
+
+        token = make_email_verification_token(user)
+        response = self.client.get(f"/api/auth/verify-email?token={token}")
+
+        self.assertEqual(response.status_code, 200)
+        user.refresh_from_db()
+        self.assertTrue(user.email_verified)
+        self.assertIsNotNone(user.email_verified_at)

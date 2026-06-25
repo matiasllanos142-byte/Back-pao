@@ -1,12 +1,15 @@
 import uuid
 from django.contrib.auth.models import AbstractUser
 from django.db import models
+from django.utils import timezone
 
 
 class User(AbstractUser):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     email = models.EmailField(unique=True)
     is_admin = models.BooleanField(default=False)
+    email_verified = models.BooleanField(default=False)
+    email_verified_at = models.DateTimeField(blank=True, null=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -18,6 +21,11 @@ class User(AbstractUser):
 
     def __str__(self):
         return self.email
+
+    def mark_email_verified(self):
+        self.email_verified = True
+        self.email_verified_at = timezone.now()
+        self.save(update_fields=["email_verified", "email_verified_at", "updated_at"])
 
 
 class Category(models.Model):

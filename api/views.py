@@ -9,6 +9,9 @@ from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework_simplejwt.tokens import AccessToken
 from django.contrib.auth import get_user_model
+from django.core import signing
+from django.http import HttpResponse
+from django.shortcuts import redirect
 from django.shortcuts import get_object_or_404
 from django.conf import settings
 import requests
@@ -31,6 +34,7 @@ from .admin_auth import (
     set_admin_cookie,
     verify_admin_credentials,
 )
+from .email_service import EmailDeliveryError, read_email_verification_token, send_verification_email
 
 User = get_user_model()
 
@@ -64,8 +68,62 @@ def register_view(request):
         return Response({"error": serializer.errors}, status=status.HTTP_400_BAD_REQUEST)
 
     user = serializer.save()
-    response = Response({"user": UserSerializer(user).data}, status=status.HTTP_201_CREATED)
+    email_result = {"sent": False, "id": None}
+    try:
+        email_result = send_verification_email(user, request)
+    except EmailDeliveryError:
+        email_result = {"sent": False, "id": None}
+
+    response = Response(
+        {
+            "user": UserSerializer(user).data,
+            "emailVerificationSent": email_result["sent"],
+        },
+        status=status.HTTP_201_CREATED,
+    )
     return set_auth_cookie(response, user)
+
+
+@api_view(["GET"])
+@permission_classes([AllowAny])
+def verify_email_view(request):
+    token = request.query_params.get("token", "")
+    try:
+        payload = read_email_verification_token(token)
+        user = User.objects.get(id=payload["user_id"], email=payload["email"])
+    except (signing.BadSignature, signing.SignatureExpired, KeyError, User.DoesNotExist):
+        if settings.EMAIL_VERIFICATION_ERROR_URL:
+            return redirect(settings.EMAIL_VERIFICATION_ERROR_URL)
+        return HttpResponse(
+            "El enlace de verificacion no es valido o ya expiro.",
+            status=400,
+            content_type="text/plain; charset=utf-8",
+        )
+
+    if not user.email_verified:
+        user.mark_email_verified()
+
+    if settings.EMAIL_VERIFICATION_SUCCESS_URL:
+        return redirect(settings.EMAIL_VERIFICATION_SUCCESS_URL)
+
+    return HttpResponse(
+        "Email verificado correctamente. Ya podes volver a Paola Psicope.",
+        content_type="text/plain; charset=utf-8",
+    )
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def resend_verification_email_view(request):
+    if request.user.email_verified:
+        return Response({"ok": True, "emailVerificationSent": False, "alreadyVerified": True})
+
+    try:
+        email_result = send_verification_email(request.user, request)
+    except EmailDeliveryError:
+        return Response({"error": "No se pudo enviar el email de verificacion."}, status=status.HTTP_502_BAD_GATEWAY)
+
+    return Response({"ok": True, "emailVerificationSent": email_result["sent"]})
 
 
 @api_view(["POST"])

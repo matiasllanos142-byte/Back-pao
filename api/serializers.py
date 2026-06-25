@@ -9,11 +9,12 @@ User = get_user_model()
 class UserSerializer(serializers.ModelSerializer):
     name = serializers.CharField(source="first_name")
     isAdmin = serializers.BooleanField(source="is_admin")
+    emailVerified = serializers.BooleanField(source="email_verified")
     createdAt = serializers.DateTimeField(source="created_at")
 
     class Meta:
         model = User
-        fields = ["id", "name", "email", "isAdmin", "createdAt"]
+        fields = ["id", "name", "email", "isAdmin", "emailVerified", "createdAt"]
 
 
 class RegisterSerializer(serializers.ModelSerializer):
