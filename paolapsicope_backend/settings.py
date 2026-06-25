@@ -162,9 +162,15 @@ SIMPLE_JWT = {
     "AUTH_HEADER_TYPES": ("Bearer",),
 }
 
+DEFAULT_CORS_ALLOWED_ORIGINS = (
+    "http://localhost:3000,"
+    "http://127.0.0.1:3000,"
+    "https://paola-psicope.vercel.app"
+)
+
 CORS_ALLOWED_ORIGINS = [
     origin.strip()
-    for origin in os.environ.get("CORS_ALLOWED_ORIGINS", "http://localhost:3000").split(",")
+    for origin in os.environ.get("CORS_ALLOWED_ORIGINS", DEFAULT_CORS_ALLOWED_ORIGINS).split(",")
     if origin.strip()
 ]
 
