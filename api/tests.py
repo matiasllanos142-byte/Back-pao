@@ -1,5 +1,7 @@
 from django.contrib.auth.hashers import make_password
 from django.test import TestCase, override_settings
+from django.core.files.uploadedfile import SimpleUploadedFile
+from unittest.mock import Mock, patch
 from rest_framework.test import APIClient
 
 from .models import Category
@@ -14,6 +16,10 @@ from .models import Category
     SECURE_SSL_REDIRECT=False,
     AUTH_COOKIE_SAMESITE="Lax",
     AUTH_COOKIE_SECURE=False,
+    CLOUDINARY_CLOUD_NAME="demo-cloud",
+    CLOUDINARY_API_KEY="demo-key",
+    CLOUDINARY_API_SECRET="demo-secret-with-at-least-32-bytes",
+    CLOUDINARY_UPLOAD_FOLDER="tests/products",
 )
 class AdminAuthTests(TestCase):
     def setUp(self):
@@ -102,3 +108,36 @@ class AdminAuthTests(TestCase):
 
         self.assertEqual(response.status_code, 201)
         self.assertEqual(response.data["title"], "Cuadernillo inicial")
+
+    @patch("api.views.requests.post")
+    def test_admin_cookie_can_upload_image_to_cloudinary(self, mocked_post):
+        mocked_response = Mock()
+        mocked_response.status_code = 200
+        mocked_response.json.return_value = {
+            "secure_url": "https://res.cloudinary.com/demo/image/upload/sample.jpg",
+            "public_id": "tests/products/sample",
+        }
+        mocked_post.return_value = mocked_response
+
+        login_response = self.client.post(
+            "/api/admin/login",
+            {"username": "paola-admin", "password": "secreto-admin"},
+            format="json",
+        )
+        self.assertEqual(login_response.status_code, 200)
+
+        image = SimpleUploadedFile(
+            "producto.png",
+            b"fake-image-content",
+            content_type="image/png",
+        )
+        response = self.client.post(
+            "/api/admin/uploads/image",
+            {"image": image},
+            format="multipart",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["url"], "https://res.cloudinary.com/demo/image/upload/sample.jpg")
+        self.assertEqual(response.data["publicId"], "tests/products/sample")
+        mocked_post.assert_called_once()

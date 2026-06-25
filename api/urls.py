@@ -5,6 +5,7 @@ urlpatterns = [
     path("admin/login", views.admin_login_view, name="admin-login"),
     path("admin/logout", views.admin_logout_view, name="admin-logout"),
     path("admin/me", views.admin_me_view, name="admin-me"),
+    path("admin/uploads/image", views.admin_image_upload_view, name="admin-image-upload"),
     path("admin/products", views.AdminProductListCreateView.as_view(), name="admin-products"),
     path("admin/products/<uuid:pk>", views.AdminProductDetailUpdateDestroyView.as_view(), name="admin-product-detail"),
     path("admin/orders", views.admin_order_list_view, name="admin-orders"),

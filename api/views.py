@@ -1,13 +1,17 @@
 import os
+import hashlib
+import time
 from decimal import Decimal
 from rest_framework import status, generics
-from rest_framework.decorators import api_view, permission_classes
+from rest_framework.decorators import api_view, parser_classes, permission_classes
+from rest_framework.parsers import FormParser, MultiPartParser
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework_simplejwt.tokens import AccessToken
 from django.contrib.auth import get_user_model
 from django.shortcuts import get_object_or_404
 from django.conf import settings
+import requests
 
 from .models import Category, Product, Order, OrderItem
 from .serializers import (
@@ -124,6 +128,66 @@ def admin_logout_view(request):
 def admin_me_view(request):
     admin = get_admin_from_request(request)
     return Response({"admin": admin})
+
+
+def sign_cloudinary_upload(params):
+    payload = "&".join(
+        f"{key}={value}"
+        for key, value in sorted(params.items())
+        if value not in [None, ""]
+    )
+    return hashlib.sha1(f"{payload}{settings.CLOUDINARY_API_SECRET}".encode("utf-8")).hexdigest()
+
+
+@api_view(["POST"])
+@permission_classes([IsEnvAdmin])
+@parser_classes([MultiPartParser, FormParser])
+def admin_image_upload_view(request):
+    image = request.FILES.get("image")
+    if not image:
+        return Response({"error": "Falta la imagen."}, status=status.HTTP_400_BAD_REQUEST)
+
+    if not image.content_type.startswith("image/"):
+        return Response({"error": "El archivo debe ser una imagen."}, status=status.HTTP_400_BAD_REQUEST)
+
+    if image.size > settings.CLOUDINARY_MAX_UPLOAD_BYTES:
+        return Response({"error": "La imagen supera el tamano maximo permitido."}, status=status.HTTP_400_BAD_REQUEST)
+
+    if not all([settings.CLOUDINARY_CLOUD_NAME, settings.CLOUDINARY_API_KEY, settings.CLOUDINARY_API_SECRET]):
+        return Response({"error": "Cloudinary no esta configurado."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+    timestamp = int(time.time())
+    upload_params = {
+        "timestamp": timestamp,
+        "folder": settings.CLOUDINARY_UPLOAD_FOLDER,
+    }
+    signature = sign_cloudinary_upload(upload_params)
+    upload_url = f"https://api.cloudinary.com/v1_1/{settings.CLOUDINARY_CLOUD_NAME}/image/upload"
+
+    try:
+        response = requests.post(
+            upload_url,
+            data={
+                **{key: value for key, value in upload_params.items() if value},
+                "api_key": settings.CLOUDINARY_API_KEY,
+                "signature": signature,
+            },
+            files={"file": (image.name, image.file, image.content_type)},
+            timeout=30,
+        )
+    except requests.RequestException:
+        return Response({"error": "No se pudo subir la imagen."}, status=status.HTTP_502_BAD_GATEWAY)
+
+    if response.status_code >= 400:
+        return Response({"error": "Cloudinary rechazo la imagen."}, status=status.HTTP_502_BAD_GATEWAY)
+
+    data = response.json()
+    return Response(
+        {
+            "url": data.get("secure_url"),
+            "publicId": data.get("public_id"),
+        }
+    )
 
 
 class ProductListCreateView(generics.ListCreateAPIView):
