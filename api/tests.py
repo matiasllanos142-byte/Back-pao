@@ -171,6 +171,7 @@ class AdminAuthTests(TestCase):
         )
 
         self.assertEqual(response.status_code, 201)
+        self.assertIn("accessToken", response.data)
         self.assertTrue(response.data["emailVerificationSent"])
         self.assertFalse(response.data["user"]["emailVerified"])
         mocked_post.assert_called_once()
@@ -180,6 +181,35 @@ class AdminAuthTests(TestCase):
         self.assertEqual(payload["from"], "Paola Psicopé <no-reply@example.com>")
         self.assertIn("https://backend.test/api/auth/verify-email?token=", payload["html"])
         self.assertEqual(headers["User-Agent"], "paola-psicope-backend/1.0")
+
+    def test_bearer_token_authenticates_user_requests(self):
+        register_response = self.client.post(
+            "/api/auth/register",
+            {
+                "name": "Cliente Token",
+                "email": "cliente-token@example.com",
+                "password": "cliente123",
+            },
+            format="json",
+        )
+        self.assertEqual(register_response.status_code, 201)
+        token = register_response.data["accessToken"]
+
+        self.client.cookies.clear()
+
+        me_response = self.client.get(
+            "/api/auth/me",
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+        self.assertEqual(me_response.status_code, 200)
+        self.assertEqual(me_response.data["user"]["email"], "cliente-token@example.com")
+
+        library_response = self.client.get(
+            "/api/library",
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+        self.assertEqual(library_response.status_code, 200)
+        self.assertEqual(library_response.data["items"], [])
 
     def test_verify_email_marks_user_as_verified(self):
         register_response = self.client.post(

@@ -43,11 +43,15 @@ COOKIE_NAME = "session"
 COOKIE_MAX_AGE = 60 * 60 * 24 * 7  # 7 días
 
 
-def set_auth_cookie(response, user):
-    token = AccessToken.for_user(user)
+def make_auth_token(user):
+    return str(AccessToken.for_user(user))
+
+
+def set_auth_cookie(response, user, token=None):
+    token = token or make_auth_token(user)
     response.set_cookie(
         COOKIE_NAME,
-        str(token),
+        token,
         httponly=True,
         secure=settings.AUTH_COOKIE_SECURE,
         samesite=settings.AUTH_COOKIE_SAMESITE,
@@ -69,20 +73,23 @@ def register_view(request):
         return Response({"error": serializer.errors}, status=status.HTTP_400_BAD_REQUEST)
 
     user = serializer.save()
-    email_result = {"sent": False, "id": None}
+    email_result = {"sent": False, "id": None, "reason": None}
     try:
         email_result = send_verification_email(user, request)
-    except EmailDeliveryError:
-        email_result = {"sent": False, "id": None}
+    except EmailDeliveryError as exc:
+        email_result = {"sent": False, "id": None, "reason": str(exc)}
 
+    token = make_auth_token(user)
     response = Response(
         {
             "user": UserSerializer(user).data,
+            "accessToken": token,
             "emailVerificationSent": email_result["sent"],
+            "emailVerificationError": email_result.get("reason"),
         },
         status=status.HTTP_201_CREATED,
     )
-    return set_auth_cookie(response, user)
+    return set_auth_cookie(response, user, token)
 
 
 @api_view(["GET"])
@@ -124,6 +131,16 @@ def resend_verification_email_view(request):
     except EmailDeliveryError:
         return Response({"error": "No se pudo enviar el email de verificacion."}, status=status.HTTP_502_BAD_GATEWAY)
 
+    if not email_result["sent"]:
+        return Response(
+            {
+                "ok": False,
+                "emailVerificationSent": False,
+                "error": "El envio de emails no esta configurado en el backend.",
+            },
+            status=status.HTTP_503_SERVICE_UNAVAILABLE,
+        )
+
     return Response({"ok": True, "emailVerificationSent": email_result["sent"]})
 
 
@@ -141,8 +158,9 @@ def login_view(request):
     if not user.check_password(password):
         return Response({"error": "Email o contraseña incorrectos."}, status=status.HTTP_401_UNAUTHORIZED)
 
-    response = Response({"user": UserSerializer(user).data})
-    return set_auth_cookie(response, user)
+    token = make_auth_token(user)
+    response = Response({"user": UserSerializer(user).data, "accessToken": token})
+    return set_auth_cookie(response, user, token)
 
 
 @api_view(["POST"])
