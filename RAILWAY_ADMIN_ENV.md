@@ -23,9 +23,21 @@ Remove-Item Env:\DJANGO_ADMIN_PASSWORD -ErrorAction SilentlyContinue
 
 Despues copia el hash resultante en Railway:
 
+Opcion recomendada: pegalo desde Railway > Variables > Raw Editor, sin comillas:
+
+```text
+ADMIN_USERNAME=admin@paolapsicope.com
+ADMIN_PASSWORD_HASH=pbkdf2_sha256$1000000$pega$el-hash-completo
+ADMIN_JWT_SECRET=una-clave-larga-y-distinta
+ADMIN_TOKEN_TTL=86400
+```
+
+Si lo haces desde PowerShell con Railway CLI, usa comillas simples en el hash.
+El hash de Django contiene `$` y PowerShell rompe el valor si usas comillas dobles.
+
 ```powershell
 railway variables --set "ADMIN_USERNAME=admin@paolapsicope.com"
-railway variables --set "ADMIN_PASSWORD_HASH=pega-el-hash-generado"
+railway variables --set 'ADMIN_PASSWORD_HASH=pega-el-hash-generado'
 railway variables --set "ADMIN_JWT_SECRET=una-clave-larga-y-distinta"
 railway variables --set "ADMIN_TOKEN_TTL=86400"
 ```

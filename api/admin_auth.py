@@ -17,14 +17,29 @@ def _cookie_samesite():
     return getattr(settings, "AUTH_COOKIE_SAMESITE", "Lax")
 
 
+def _clean_setting(value):
+    cleaned = str(value or "").strip()
+    while len(cleaned) >= 2 and cleaned[0] == cleaned[-1] and cleaned[0] in {"'", '"'}:
+        cleaned = cleaned[1:-1].strip()
+    return cleaned
+
+
+def _admin_username():
+    return _clean_setting(getattr(settings, "ADMIN_USERNAME", ""))
+
+
+def _admin_jwt_secret():
+    return _clean_setting(getattr(settings, "ADMIN_JWT_SECRET", ""))
+
+
 def verify_admin_credentials(username, password):
-    expected_username = getattr(settings, "ADMIN_USERNAME", "")
-    password_hash = getattr(settings, "ADMIN_PASSWORD_HASH", "")
+    expected_username = _admin_username()
+    password_hash = _clean_setting(getattr(settings, "ADMIN_PASSWORD_HASH", ""))
 
     if not expected_username or not password_hash:
         return False
 
-    return username == expected_username and check_password(password, password_hash)
+    return username.strip().lower() == expected_username.lower() and check_password(password, password_hash)
 
 
 def _get_bearer_token(request):
@@ -38,13 +53,14 @@ def _get_bearer_token(request):
 def create_admin_token(username):
     now = datetime.now(timezone.utc)
     expires_at = now + timedelta(seconds=getattr(settings, "ADMIN_TOKEN_TTL", 86400))
+    subject = _admin_username() or _clean_setting(username)
     payload = {
-        "sub": username,
+        "sub": subject,
         "role": "admin",
         "iat": int(now.timestamp()),
         "exp": expires_at,
     }
-    return jwt.encode(payload, settings.ADMIN_JWT_SECRET, algorithm=ADMIN_JWT_ALGORITHM)
+    return jwt.encode(payload, _admin_jwt_secret(), algorithm=ADMIN_JWT_ALGORITHM)
 
 
 def get_admin_from_request(request):
@@ -60,17 +76,22 @@ def get_admin_from_request(request):
     try:
         payload = jwt.decode(
             token,
-            settings.ADMIN_JWT_SECRET,
+            _admin_jwt_secret(),
             algorithms=[ADMIN_JWT_ALGORITHM],
         )
     except jwt.PyJWTError:
         return None
 
     username = payload.get("sub")
-    if payload.get("role") != "admin" or username != settings.ADMIN_USERNAME:
+    expected_username = _admin_username()
+    if (
+        payload.get("role") != "admin"
+        or not username
+        or username.lower() != expected_username.lower()
+    ):
         return None
 
-    return {"username": username}
+    return {"username": expected_username}
 
 
 def set_admin_cookie(response, token):

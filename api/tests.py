@@ -65,6 +65,31 @@ class AdminAuthTests(TestCase):
         self.assertIn("admin_session", response.cookies)
         self.assertNotIn("session", response.cookies)
 
+    @override_settings(
+        ADMIN_USERNAME='"paola-admin"',
+        ADMIN_PASSWORD_HASH=f'"{make_password("secreto-admin")}"',
+        ADMIN_JWT_SECRET="'quoted-admin-secret-with-at-least-32-bytes'",
+    )
+    def test_admin_login_accepts_quoted_railway_values(self):
+        response = self.client.post(
+            "/api/admin/login",
+            {"username": "PAOLA-ADMIN", "password": "secreto-admin"},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["admin"]["username"], "PAOLA-ADMIN")
+        self.assertIn("adminToken", response.data)
+
+        self.client.cookies.clear()
+        me_response = self.client.get(
+            "/api/admin/me",
+            HTTP_AUTHORIZATION=f"Bearer {response.data['adminToken']}",
+        )
+
+        self.assertEqual(me_response.status_code, 200)
+        self.assertEqual(me_response.data["admin"]["username"], "paola-admin")
+
     def test_admin_bearer_token_can_access_admin_endpoints(self):
         login_response = self.client.post(
             "/api/admin/login",
