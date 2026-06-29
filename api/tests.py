@@ -1,10 +1,11 @@
 from django.contrib.auth.hashers import make_password
 from django.test import TestCase, override_settings
 from django.core.files.uploadedfile import SimpleUploadedFile
+from django.utils import timezone
 from unittest.mock import Mock, patch
 from rest_framework.test import APIClient
 
-from .models import Category, Product, PurchasedProduct, User
+from .models import Category, PendingRegistration, Product, PurchasedProduct, User
 from .email_service import make_email_verification_token
 
 
@@ -40,6 +41,24 @@ class AdminAuthTests(TestCase):
             description="Recursos de estimulacion",
             icon="Brain",
             color="#3F87EC",
+        )
+
+    def create_verified_user(self, email, name="Cliente", password="cliente123"):
+        return User.objects.create(
+            username=email,
+            email=email,
+            first_name=name,
+            is_admin=False,
+            password=make_password(password),
+            email_verified=True,
+            email_verified_at=timezone.now(),
+        )
+
+    def login_user(self, email, password="cliente123"):
+        return self.client.post(
+            "/api/auth/login",
+            {"email": email, "password": password},
+            format="json",
         )
 
     def test_admin_login_rejects_invalid_credentials(self):
@@ -130,12 +149,9 @@ class AdminAuthTests(TestCase):
         self.assertEqual(response.data["title"], "Producto bearer")
 
     def test_public_user_session_cannot_create_admin_product(self):
-        register_response = self.client.post(
-            "/api/auth/register",
-            {"name": "Cliente", "email": "cliente@test.com", "password": "cliente123"},
-            format="json",
-        )
-        self.assertEqual(register_response.status_code, 201)
+        self.create_verified_user("cliente@test.com")
+        login_response = self.login_user("cliente@test.com")
+        self.assertEqual(login_response.status_code, 200)
 
         response = self.client.post(
             "/api/admin/products",
@@ -157,13 +173,10 @@ class AdminAuthTests(TestCase):
         self.assertEqual(response.status_code, 401)
 
     def test_public_user_bearer_token_cannot_create_admin_product(self):
-        register_response = self.client.post(
-            "/api/auth/register",
-            {"name": "Cliente Token", "email": "cliente-token-admin@test.com", "password": "cliente123"},
-            format="json",
-        )
-        self.assertEqual(register_response.status_code, 201)
-        token = register_response.data["accessToken"]
+        self.create_verified_user("cliente-token-admin@test.com", name="Cliente Token")
+        login_response = self.login_user("cliente-token-admin@test.com")
+        self.assertEqual(login_response.status_code, 200)
+        token = login_response.data["accessToken"]
 
         self.client.cookies.clear()
 
@@ -249,8 +262,9 @@ class AdminAuthTests(TestCase):
         mocked_post.assert_called_once()
 
     @override_settings(RESEND_API_KEY="re_test")
+    @patch("api.views.make_registration_code", return_value="123456")
     @patch("api.email_service.requests.post")
-    def test_register_sends_verification_email_with_resend(self, mocked_post):
+    def test_register_sends_verification_code_without_creating_user(self, mocked_post, mocked_code):
         mocked_response = Mock()
         mocked_response.status_code = 200
         mocked_response.json.return_value = {"id": "email_123"}
@@ -266,30 +280,87 @@ class AdminAuthTests(TestCase):
             format="json",
         )
 
-        self.assertEqual(response.status_code, 201)
-        self.assertIn("accessToken", response.data)
+        self.assertEqual(response.status_code, 202)
+        self.assertNotIn("accessToken", response.data)
         self.assertTrue(response.data["emailVerificationSent"])
-        self.assertFalse(response.data["user"]["emailVerified"])
+        self.assertTrue(response.data["emailVerificationRequired"])
+        self.assertFalse(User.objects.filter(email="cliente@example.com").exists())
+        self.assertTrue(PendingRegistration.objects.filter(email="cliente@example.com").exists())
         mocked_post.assert_called_once()
         payload = mocked_post.call_args.kwargs["json"]
         headers = mocked_post.call_args.kwargs["headers"]
         self.assertEqual(payload["to"], ["cliente@example.com"])
         self.assertEqual(payload["from"], "Paola Psicopé <no-reply@example.com>")
-        self.assertIn("https://backend.test/api/auth/verify-email?token=", payload["html"])
+        self.assertIn("123456", payload["html"])
+        self.assertNotIn("/api/auth/verify-email?token=", payload["html"])
         self.assertEqual(headers["User-Agent"], "paola-psicope-backend/1.0")
 
-    def test_bearer_token_authenticates_user_requests(self):
+    @override_settings(RESEND_API_KEY="re_test")
+    @patch("api.views.make_registration_code", return_value="123456")
+    @patch("api.email_service.requests.post")
+    def test_verify_registration_code_creates_verified_user(self, mocked_post, mocked_code):
+        mocked_response = Mock()
+        mocked_response.status_code = 200
+        mocked_response.json.return_value = {"id": "email_123"}
+        mocked_post.return_value = mocked_response
+
         register_response = self.client.post(
             "/api/auth/register",
             {
-                "name": "Cliente Token",
-                "email": "cliente-token@example.com",
+                "name": "Cliente Codigo",
+                "email": "codigo@example.com",
                 "password": "cliente123",
             },
             format="json",
         )
-        self.assertEqual(register_response.status_code, 201)
-        token = register_response.data["accessToken"]
+        self.assertEqual(register_response.status_code, 202)
+
+        verify_response = self.client.post(
+            "/api/auth/register/verify-code",
+            {"email": "codigo@example.com", "code": "123456"},
+            format="json",
+        )
+
+        self.assertEqual(verify_response.status_code, 201)
+        self.assertIn("accessToken", verify_response.data)
+        self.assertTrue(verify_response.data["user"]["emailVerified"])
+        self.assertIn("session", verify_response.cookies)
+        self.assertFalse(PendingRegistration.objects.filter(email="codigo@example.com").exists())
+
+        user = User.objects.get(email="codigo@example.com")
+        self.assertTrue(user.email_verified)
+        self.assertTrue(user.check_password("cliente123"))
+
+    @override_settings(RESEND_API_KEY="re_test")
+    @patch("api.email_service.requests.post")
+    def test_register_does_not_create_user_when_resend_rejects(self, mocked_post):
+        mocked_response = Mock()
+        mocked_response.status_code = 403
+        mocked_response.text = '{"message":"You can only send testing emails to your own email address"}'
+        mocked_response.json.return_value = {
+            "message": "You can only send testing emails to your own email address"
+        }
+        mocked_post.return_value = mocked_response
+
+        response = self.client.post(
+            "/api/auth/register",
+            {
+                "name": "Cliente Rechazado",
+                "email": "rechazado@example.com",
+                "password": "cliente123",
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 502)
+        self.assertFalse(User.objects.filter(email="rechazado@example.com").exists())
+        self.assertFalse(PendingRegistration.objects.filter(email="rechazado@example.com").exists())
+
+    def test_bearer_token_authenticates_user_requests(self):
+        self.create_verified_user("cliente-token@example.com", name="Cliente Token")
+        login_response = self.login_user("cliente-token@example.com")
+        self.assertEqual(login_response.status_code, 200)
+        token = login_response.data["accessToken"]
 
         self.client.cookies.clear()
 
@@ -308,18 +379,13 @@ class AdminAuthTests(TestCase):
         self.assertEqual(library_response.data["items"], [])
 
     def test_verify_email_marks_user_as_verified(self):
-        register_response = self.client.post(
-            "/api/auth/register",
-            {
-                "name": "Cliente Verificacion",
-                "email": "verifica@example.com",
-                "password": "cliente123",
-            },
-            format="json",
+        user = User.objects.create(
+            username="verifica@example.com",
+            email="verifica@example.com",
+            first_name="Cliente Verificacion",
+            password=make_password("cliente123"),
+            email_verified=False,
         )
-        self.assertEqual(register_response.status_code, 201)
-
-        user = User.objects.get(email="verifica@example.com")
         self.assertFalse(user.email_verified)
 
         token = make_email_verification_token(user)
@@ -368,12 +434,9 @@ class AdminAuthTests(TestCase):
             features=[],
             objectives=[],
         )
-        register_response = self.client.post(
-            "/api/auth/register",
-            {"name": "Cliente", "email": "cliente-biblioteca@test.com", "password": "cliente123"},
-            format="json",
-        )
-        self.assertEqual(register_response.status_code, 201)
+        self.create_verified_user("cliente-biblioteca@test.com", name="Cliente")
+        login_response = self.login_user("cliente-biblioteca@test.com")
+        self.assertEqual(login_response.status_code, 200)
 
         payment_response = self.client.post(
             "/api/payments/create-preference",

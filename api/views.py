@@ -2,6 +2,8 @@ import os
 import hashlib
 import time
 import base64
+import secrets
+from datetime import timedelta
 from decimal import Decimal
 from rest_framework import status, generics
 from rest_framework.decorators import api_view, parser_classes, permission_classes
@@ -10,14 +12,17 @@ from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework_simplejwt.tokens import AccessToken
 from django.contrib.auth import get_user_model
+from django.contrib.auth.hashers import check_password, make_password
 from django.core import signing
+from django.db import transaction
 from django.http import HttpResponse
 from django.shortcuts import redirect
 from django.shortcuts import get_object_or_404
 from django.conf import settings
+from django.utils import timezone
 import requests
 
-from .models import Category, Product, Order, OrderItem, PurchasedProduct
+from .models import Category, Product, Order, OrderItem, PendingRegistration, PurchasedProduct
 from .serializers import (
     UserSerializer,
     RegisterSerializer,
@@ -36,7 +41,12 @@ from .admin_auth import (
     set_admin_cookie,
     verify_admin_credentials,
 )
-from .email_service import EmailDeliveryError, read_email_verification_token, send_verification_email
+from .email_service import (
+    EmailDeliveryError,
+    read_email_verification_token,
+    send_registration_code_email,
+    send_verification_email,
+)
 from .cloudinary_settings import (
     get_cloudinary_credentials,
     resolve_cloudinary_credentials,
@@ -72,6 +82,24 @@ def clear_auth_cookie(response):
     return response
 
 
+def make_registration_code():
+    return f"{secrets.randbelow(1_000_000):06d}"
+
+
+def pending_registration_expires_at():
+    return timezone.now() + timedelta(seconds=settings.EMAIL_VERIFICATION_CODE_TTL_SECONDS)
+
+
+def format_email_delivery_error(exc):
+    message = str(exc) or "No se pudo enviar el codigo de verificacion."
+    if "own email address" in message and "verify a domain" in message:
+        return (
+            "Resend esta en modo prueba: con onboarding@resend.dev solo puede enviar "
+            "al email dueño de la cuenta de Resend. Para enviar a otros emails hay que verificar un dominio."
+        )
+    return message
+
+
 @api_view(["POST"])
 @permission_classes([AllowAny])
 def register_view(request):
@@ -79,24 +107,152 @@ def register_view(request):
     if not serializer.is_valid():
         return Response({"error": serializer.errors}, status=status.HTTP_400_BAD_REQUEST)
 
-    user = serializer.save()
-    email_result = {"sent": False, "id": None, "reason": None}
+    email = serializer.validated_data["email"].lower().strip()
+    name = serializer.validated_data.get("name") or serializer.validated_data.get("first_name", "")
+    password = serializer.validated_data["password"]
+
+    if User.objects.filter(email=email).exists():
+        return Response({"error": "Ya existe una cuenta con este email."}, status=status.HTTP_400_BAD_REQUEST)
+
+    code = make_registration_code()
     try:
-        email_result = send_verification_email(user, request)
+        send_registration_code_email(name, email, code)
     except EmailDeliveryError as exc:
-        email_result = {"sent": False, "id": None, "reason": str(exc)}
+        PendingRegistration.objects.filter(email=email).delete()
+        return Response(
+            {
+                "error": format_email_delivery_error(exc),
+                "emailVerificationSent": False,
+            },
+            status=status.HTTP_502_BAD_GATEWAY,
+        )
+
+    PendingRegistration.objects.update_or_create(
+        email=email,
+        defaults={
+            "name": name,
+            "password_hash": make_password(password),
+            "verification_code_hash": make_password(code),
+            "attempts": 0,
+            "expires_at": pending_registration_expires_at(),
+        },
+    )
+
+    response = Response(
+        {
+            "email": email,
+            "emailVerificationRequired": True,
+            "emailVerificationSent": True,
+            "expiresInSeconds": settings.EMAIL_VERIFICATION_CODE_TTL_SECONDS,
+        },
+        status=status.HTTP_202_ACCEPTED,
+    )
+    return response
+
+
+@api_view(["POST"])
+@permission_classes([AllowAny])
+def verify_registration_code_view(request):
+    email = request.data.get("email", "").lower().strip()
+    code = request.data.get("code", "").strip()
+
+    if not email or not code:
+        return Response({"error": "Email y codigo son obligatorios."}, status=status.HTTP_400_BAD_REQUEST)
+
+    try:
+        pending = PendingRegistration.objects.get(email=email)
+    except PendingRegistration.DoesNotExist:
+        return Response({"error": "No hay una verificacion pendiente para este email."}, status=status.HTTP_400_BAD_REQUEST)
+
+    if pending.is_expired():
+        pending.delete()
+        return Response({"error": "El codigo vencio. Pedi uno nuevo para continuar."}, status=status.HTTP_400_BAD_REQUEST)
+
+    max_attempts = settings.EMAIL_VERIFICATION_CODE_MAX_ATTEMPTS
+    if pending.attempts >= max_attempts:
+        pending.delete()
+        return Response({"error": "Se supero el limite de intentos. Pedi un nuevo codigo."}, status=status.HTTP_429_TOO_MANY_REQUESTS)
+
+    if not check_password(code, pending.verification_code_hash):
+        pending.attempts += 1
+        pending.save(update_fields=["attempts", "updated_at"])
+        remaining = max(max_attempts - pending.attempts, 0)
+        return Response(
+            {
+                "error": "Codigo incorrecto.",
+                "attemptsRemaining": remaining,
+            },
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    if User.objects.filter(email=email).exists():
+        pending.delete()
+        return Response({"error": "Ya existe una cuenta con este email."}, status=status.HTTP_400_BAD_REQUEST)
+
+    with transaction.atomic():
+        user = User.objects.create(
+            username=email,
+            email=email,
+            first_name=pending.name,
+            is_admin=False,
+            password=pending.password_hash,
+            email_verified=True,
+            email_verified_at=timezone.now(),
+        )
+        pending.delete()
 
     token = make_auth_token(user)
     response = Response(
-        {
-            "user": UserSerializer(user).data,
-            "accessToken": token,
-            "emailVerificationSent": email_result["sent"],
-            "emailVerificationError": email_result.get("reason"),
-        },
+        {"user": UserSerializer(user).data, "accessToken": token},
         status=status.HTTP_201_CREATED,
     )
     return set_auth_cookie(response, user, token)
+
+
+@api_view(["POST"])
+@permission_classes([AllowAny])
+def resend_registration_code_view(request):
+    email = request.data.get("email", "").lower().strip()
+    if not email:
+        return Response({"error": "El email es obligatorio."}, status=status.HTTP_400_BAD_REQUEST)
+
+    if User.objects.filter(email=email).exists():
+        return Response({"error": "Ya existe una cuenta con este email."}, status=status.HTTP_400_BAD_REQUEST)
+
+    try:
+        pending = PendingRegistration.objects.get(email=email)
+    except PendingRegistration.DoesNotExist:
+        return Response({"error": "No hay una verificacion pendiente para este email."}, status=status.HTTP_400_BAD_REQUEST)
+
+    if pending.is_expired():
+        pending.delete()
+        return Response({"error": "El codigo vencio. Comenza el registro nuevamente."}, status=status.HTTP_400_BAD_REQUEST)
+
+    code = make_registration_code()
+    try:
+        send_registration_code_email(pending.name, pending.email, code)
+    except EmailDeliveryError as exc:
+        return Response(
+            {
+                "error": format_email_delivery_error(exc),
+                "emailVerificationSent": False,
+            },
+            status=status.HTTP_502_BAD_GATEWAY,
+        )
+
+    pending.verification_code_hash = make_password(code)
+    pending.expires_at = pending_registration_expires_at()
+    pending.attempts = 0
+    pending.save(update_fields=["verification_code_hash", "expires_at", "attempts", "updated_at"])
+
+    return Response(
+        {
+            "email": email,
+            "emailVerificationRequired": True,
+            "emailVerificationSent": True,
+            "expiresInSeconds": settings.EMAIL_VERIFICATION_CODE_TTL_SECONDS,
+        }
+    )
 
 
 @api_view(["GET"])

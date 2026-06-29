@@ -1,6 +1,6 @@
 from django.contrib import admin
 from django.contrib.auth.admin import UserAdmin as BaseUserAdmin
-from .models import User, Category, Product, Order, OrderItem, CloudinarySettings
+from .models import User, Category, Product, Order, OrderItem, CloudinarySettings, PendingRegistration
 
 
 @admin.register(User)
@@ -39,6 +39,13 @@ class ProductAdmin(admin.ModelAdmin):
 @admin.register(CloudinarySettings)
 class CloudinarySettingsAdmin(admin.ModelAdmin):
     list_display = ["cloud_name", "api_key", "updated_at"]
+    readonly_fields = ["created_at", "updated_at"]
+
+
+@admin.register(PendingRegistration)
+class PendingRegistrationAdmin(admin.ModelAdmin):
+    list_display = ["email", "name", "attempts", "expires_at", "created_at"]
+    search_fields = ["email", "name"]
     readonly_fields = ["created_at", "updated_at"]
 
 

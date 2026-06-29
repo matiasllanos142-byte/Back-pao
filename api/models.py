@@ -28,6 +28,27 @@ class User(AbstractUser):
         self.save(update_fields=["email_verified", "email_verified_at", "updated_at"])
 
 
+class PendingRegistration(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    email = models.EmailField(unique=True)
+    name = models.CharField(max_length=300)
+    password_hash = models.CharField(max_length=200)
+    verification_code_hash = models.CharField(max_length=200)
+    attempts = models.PositiveSmallIntegerField(default=0)
+    expires_at = models.DateTimeField()
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "pending_registrations"
+
+    def __str__(self):
+        return self.email
+
+    def is_expired(self):
+        return timezone.now() >= self.expires_at
+
+
 class Category(models.Model):
     slug = models.SlugField(primary_key=True, max_length=100)
     name = models.CharField(max_length=200)

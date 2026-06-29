@@ -72,12 +72,20 @@ def send_resend_email(message):
         raise EmailDeliveryError("No se pudo conectar con Resend.") from exc
 
     if response.status_code >= 400:
+        reason = "Resend rechazo el envio del email."
+        try:
+            data = response.json()
+            if data.get("message"):
+                reason = data["message"]
+        except ValueError:
+            pass
+
         logger.warning(
             "Resend rejected email with status %s: %s",
             response.status_code,
             response.text[:500],
         )
-        raise EmailDeliveryError("Resend rechazo el envio del email.")
+        raise EmailDeliveryError(reason)
 
     data = response.json()
     return {"sent": True, "id": data.get("id"), "reason": None}
@@ -156,6 +164,74 @@ def send_verification_email(user, request=None):
     return send_resend_email(
         {
             "to": user.email,
+            "subject": subject,
+            "html": html,
+            "text": text,
+        }
+    )
+
+
+def send_registration_code_email(name, email, code):
+    safe_name = escape(name or "familia")
+    safe_code = escape(code)
+
+    subject = f"Tu codigo de verificacion es {code}"
+    html = f"""
+    <div style="margin:0;padding:0;background:#f7f3f7;font-family:Arial,sans-serif;color:#111827">
+      <div style="max-width:640px;margin:0 auto;padding:32px 16px">
+        <div style="background:#ffffff;border:1px solid #e5e7eb;border-radius:22px;overflow:hidden">
+          <div style="background:#3F87EC;padding:28px;color:#ffffff">
+            <p style="margin:0 0 8px;font-size:12px;font-weight:700;letter-spacing:2px;text-transform:uppercase">
+              Lic. Paola Zabala
+            </p>
+            <h1 style="margin:0;font-size:28px;line-height:1.2">
+              Verifica tu cuenta
+            </h1>
+          </div>
+
+          <div style="padding:30px;line-height:1.65">
+            <p style="margin:0 0 14px;font-size:16px">Hola {safe_name},</p>
+            <p style="margin:0 0 18px;font-size:16px">
+              Para terminar de crear tu cuenta en Paola Psicope, ingresa este codigo en la pagina de registro:
+            </p>
+
+            <div style="margin:0 0 24px;text-align:center">
+              <div style="display:inline-block;background:#eff6ff;border:1px solid #bfdbfe;border-radius:18px;padding:18px 26px">
+                <p style="margin:0;color:#1d4ed8;font-size:34px;font-weight:800;letter-spacing:8px">
+                  {safe_code}
+                </p>
+              </div>
+            </div>
+
+            <div style="background:#f8fafc;border-radius:14px;padding:16px 18px;margin:0 0 22px">
+              <p style="margin:0;font-size:14px;color:#475569">
+                Si no pediste crear esta cuenta, podes ignorar este email. No se creara ninguna cuenta sin este codigo.
+              </p>
+            </div>
+
+            <p style="margin:0;font-size:14px;color:#6b7280">
+              Este codigo vence en unos minutos para proteger tus datos.
+            </p>
+          </div>
+
+          <div style="padding:18px 28px;background:#fafafa;border-top:1px solid #e5e7eb">
+            <p style="margin:0;font-size:13px;color:#6b7280">
+              Paola Psicope · Consultorio psicopedagogico · @paola_psicope
+            </p>
+          </div>
+        </div>
+      </div>
+    </div>
+    """
+    text = (
+        f"Hola {name or ''},\n\n"
+        f"Tu codigo para crear la cuenta en Paola Psicope es: {code}\n\n"
+        "Si no pediste esta cuenta, ignora este mensaje."
+    )
+
+    return send_resend_email(
+        {
+            "to": email,
             "subject": subject,
             "html": html,
             "text": text,
