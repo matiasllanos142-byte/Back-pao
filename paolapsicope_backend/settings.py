@@ -7,12 +7,28 @@ import os
 import dj_database_url
 from dotenv import load_dotenv
 from datetime import timedelta
+from urllib.parse import urlparse
 
 env_path = Path(__file__).resolve().parent.parent / ".env"
 if env_path.exists():
     load_dotenv(dotenv_path=env_path, override=True, encoding="utf-8")
 
 BASE_DIR = Path(__file__).resolve().parent.parent
+
+
+def url_with_default_scheme(value):
+    cleaned = str(value or "").strip().strip('"').strip("'").rstrip("/")
+    if not cleaned:
+        return ""
+
+    parsed = urlparse(cleaned)
+    if parsed.scheme and parsed.netloc:
+        return cleaned
+
+    if cleaned.startswith(("localhost", "127.0.0.1", "[::1]")):
+        return f"http://{cleaned}"
+
+    return f"https://{cleaned}"
 
 SECRET_KEY = os.environ.get("SECRET_KEY", "django-insecure-cambia-en-produccion")
 
@@ -40,7 +56,7 @@ CLOUDINARY_MAX_UPLOAD_BYTES = int(os.environ.get("CLOUDINARY_MAX_UPLOAD_BYTES", 
 CLOUDINARY_DOWNLOAD_FOLDER = os.environ.get("CLOUDINARY_DOWNLOAD_FOLDER", "paola-psicope/downloads")
 CLOUDINARY_MAX_DOWNLOAD_BYTES = int(os.environ.get("CLOUDINARY_MAX_DOWNLOAD_BYTES", str(25 * 1024 * 1024)))
 
-BACKEND_PUBLIC_URL = os.environ.get("BACKEND_PUBLIC_URL", "").rstrip("/")
+BACKEND_PUBLIC_URL = url_with_default_scheme(os.environ.get("BACKEND_PUBLIC_URL", ""))
 RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
 RESEND_FROM_EMAIL = os.environ.get("RESEND_FROM_EMAIL", "Paola Psicopé <onboarding@resend.dev>")
 RESEND_REPLY_TO = os.environ.get("RESEND_REPLY_TO", "")
@@ -48,11 +64,11 @@ RESEND_TIMEOUT_SECONDS = int(os.environ.get("RESEND_TIMEOUT_SECONDS", "15"))
 EMAIL_VERIFICATION_TOKEN_TTL_SECONDS = int(
     os.environ.get("EMAIL_VERIFICATION_TOKEN_TTL_SECONDS", str(60 * 60 * 24))
 )
-EMAIL_VERIFICATION_SUCCESS_URL = os.environ.get("EMAIL_VERIFICATION_SUCCESS_URL", "")
-EMAIL_VERIFICATION_ERROR_URL = os.environ.get("EMAIL_VERIFICATION_ERROR_URL", "")
+EMAIL_VERIFICATION_SUCCESS_URL = url_with_default_scheme(os.environ.get("EMAIL_VERIFICATION_SUCCESS_URL", ""))
+EMAIL_VERIFICATION_ERROR_URL = url_with_default_scheme(os.environ.get("EMAIL_VERIFICATION_ERROR_URL", ""))
 MP_ACCESS_TOKEN = os.environ.get("MP_ACCESS_TOKEN", "")
 MP_WEBHOOK_SECRET = os.environ.get("MP_WEBHOOK_SECRET", "")
-FRONTEND_URL = os.environ.get("FRONTEND_URL", "http://localhost:3000").rstrip("/")
+FRONTEND_URL = url_with_default_scheme(os.environ.get("FRONTEND_URL", "http://localhost:3000"))
 
 INSTALLED_APPS = [
     "django.contrib.admin",
@@ -169,7 +185,7 @@ DEFAULT_CORS_ALLOWED_ORIGINS = [
     "https://paola-psicope.vercel.app",
 ]
 CONFIGURED_CORS_ALLOWED_ORIGINS = [
-    origin.strip()
+    url_with_default_scheme(origin)
     for origin in os.environ.get("CORS_ALLOWED_ORIGINS", "").split(",")
     if origin.strip()
 ]
