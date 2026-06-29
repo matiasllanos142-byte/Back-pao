@@ -3,6 +3,18 @@ from rest_framework_simplejwt.tokens import AccessToken
 from rest_framework.exceptions import AuthenticationFailed
 
 
+PUBLIC_AUTH_PATHS = {
+    "/api/auth/login",
+    "/api/auth/logout",
+    "/api/auth/register",
+    "/api/auth/register/verify-code",
+    "/api/auth/register/resend-code",
+    "/api/auth/verify-email",
+    "/api/auth/password-reset/request",
+    "/api/auth/password-reset/confirm",
+}
+
+
 class JWTCookieAuthentication(JWTAuthentication):
     def _get_verified_user(self, validated_token):
         user = self.get_user(validated_token)
@@ -14,7 +26,16 @@ class JWTCookieAuthentication(JWTAuthentication):
         if request.path_info.startswith("/api/admin"):
             return None
 
-        if request.path_info == "/api/auth/logout":
+        path = request.path_info.rstrip("/") or request.path_info
+        if path in PUBLIC_AUTH_PATHS:
+            return None
+
+        if request.method == "GET" and (
+            path == "/api/products" or path.startswith("/api/products/")
+        ):
+            return None
+
+        if path == "/api/payments/webhook":
             return None
 
         header = self.get_header(request)

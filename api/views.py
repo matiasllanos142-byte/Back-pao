@@ -22,7 +22,15 @@ from django.conf import settings
 from django.utils import timezone
 import requests
 
-from .models import Category, Product, Order, OrderItem, PendingRegistration, PurchasedProduct
+from .models import (
+    Category,
+    Product,
+    Order,
+    OrderItem,
+    PasswordResetRequest,
+    PendingRegistration,
+    PurchasedProduct,
+)
 from .serializers import (
     UserSerializer,
     RegisterSerializer,
@@ -44,6 +52,7 @@ from .admin_auth import (
 from .email_service import (
     EmailDeliveryError,
     read_email_verification_token,
+    send_password_reset_code_email,
     send_registration_code_email,
     send_verification_email,
 )
@@ -90,6 +99,10 @@ def pending_registration_expires_at():
     return timezone.now() + timedelta(seconds=settings.EMAIL_VERIFICATION_CODE_TTL_SECONDS)
 
 
+def password_reset_expires_at():
+    return timezone.now() + timedelta(seconds=settings.PASSWORD_RESET_CODE_TTL_SECONDS)
+
+
 def format_email_delivery_error(exc):
     message = str(exc) or "No se pudo enviar el codigo de verificacion."
     if "own email address" in message and "verify a domain" in message:
@@ -114,7 +127,14 @@ def register_view(request):
     existing_user = User.objects.filter(email=email).first()
     if existing_user:
         if existing_user.email_verified:
-            return Response({"error": "Ya existe una cuenta con este email."}, status=status.HTTP_400_BAD_REQUEST)
+            return Response(
+                {
+                    "error": "Ya existe una cuenta con este email. Recupera tu contrasena para ingresar.",
+                    "recoverPassword": True,
+                    "email": email,
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
         if existing_user.purchased_products.exists() or existing_user.orders.exists():
             return Response(
                 {
@@ -263,6 +283,132 @@ def resend_registration_code_view(request):
             "expiresInSeconds": settings.EMAIL_VERIFICATION_CODE_TTL_SECONDS,
         }
     )
+
+
+@api_view(["POST"])
+@permission_classes([AllowAny])
+def password_reset_request_view(request):
+    email = request.data.get("email", "").lower().strip()
+    if not email:
+        return Response({"error": "El email es obligatorio."}, status=status.HTTP_400_BAD_REQUEST)
+
+    user = User.objects.filter(email=email, email_verified=True, is_active=True).first()
+    if not user:
+        return Response(
+            {
+                "ok": True,
+                "email": email,
+                "emailSent": False,
+                "message": "Si el email existe, te mandamos un codigo para recuperar la contrasena.",
+            }
+        )
+
+    code = make_registration_code()
+    try:
+        send_password_reset_code_email(user.first_name, user.email, code)
+    except EmailDeliveryError as exc:
+        return Response(
+            {
+                "error": format_email_delivery_error(exc),
+                "emailSent": False,
+            },
+            status=status.HTTP_502_BAD_GATEWAY,
+        )
+
+    PasswordResetRequest.objects.create(
+        user=user,
+        email=user.email,
+        verification_code_hash=make_password(code),
+        attempts=0,
+        expires_at=password_reset_expires_at(),
+    )
+
+    return Response(
+        {
+            "ok": True,
+            "email": user.email,
+            "emailSent": True,
+            "expiresInSeconds": settings.PASSWORD_RESET_CODE_TTL_SECONDS,
+        }
+    )
+
+
+@api_view(["POST"])
+@permission_classes([AllowAny])
+def password_reset_confirm_view(request):
+    email = request.data.get("email", "").lower().strip()
+    code = request.data.get("code", "").strip()
+    password = request.data.get("password", "")
+
+    if not email or not code or not password:
+        return Response(
+            {"error": "Email, codigo y contrasena son obligatorios."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    if len(password) < 6:
+        return Response(
+            {"error": "La contrasena debe tener al menos 6 caracteres."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    try:
+        reset_request = (
+            PasswordResetRequest.objects.select_related("user")
+            .filter(email=email, used_at__isnull=True)
+            .latest("created_at")
+        )
+    except PasswordResetRequest.DoesNotExist:
+        return Response(
+            {"error": "No hay una recuperacion pendiente para este email."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    if reset_request.is_expired():
+        reset_request.used_at = timezone.now()
+        reset_request.save(update_fields=["used_at", "updated_at"])
+        return Response(
+            {"error": "El codigo vencio. Pedi uno nuevo para continuar."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    max_attempts = settings.PASSWORD_RESET_CODE_MAX_ATTEMPTS
+    if reset_request.attempts >= max_attempts:
+        reset_request.used_at = timezone.now()
+        reset_request.save(update_fields=["used_at", "updated_at"])
+        return Response(
+            {"error": "Se supero el limite de intentos. Pedi un nuevo codigo."},
+            status=status.HTTP_429_TOO_MANY_REQUESTS,
+        )
+
+    if not check_password(code, reset_request.verification_code_hash):
+        reset_request.attempts += 1
+        reset_request.save(update_fields=["attempts", "updated_at"])
+        remaining = max(max_attempts - reset_request.attempts, 0)
+        return Response(
+            {
+                "error": "Codigo incorrecto.",
+                "attemptsRemaining": remaining,
+            },
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    user = reset_request.user
+    with transaction.atomic():
+        user.set_password(password)
+        user.email_verified = True
+        if user.email_verified_at is None:
+            user.email_verified_at = timezone.now()
+        user.save(update_fields=["password", "email_verified", "email_verified_at", "updated_at"])
+
+        now = timezone.now()
+        PasswordResetRequest.objects.filter(
+            user=user,
+            used_at__isnull=True,
+        ).update(used_at=now, updated_at=now)
+
+    response = Response({"ok": True})
+    return clear_auth_cookie(response)
 
 
 @api_view(["GET"])

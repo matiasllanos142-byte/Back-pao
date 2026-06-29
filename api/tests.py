@@ -6,7 +6,14 @@ from unittest.mock import Mock, patch
 from rest_framework.test import APIClient
 from rest_framework_simplejwt.tokens import AccessToken
 
-from .models import Category, PendingRegistration, Product, PurchasedProduct, User
+from .models import (
+    Category,
+    PasswordResetRequest,
+    PendingRegistration,
+    Product,
+    PurchasedProduct,
+    User,
+)
 from .email_service import make_email_verification_token
 
 
@@ -28,6 +35,8 @@ from .email_service import make_email_verification_token
     RESEND_FROM_EMAIL="Paola Psicopé <no-reply@example.com>",
     RESEND_REPLY_TO="contacto@example.com",
     EMAIL_VERIFICATION_TOKEN_TTL_SECONDS=86400,
+    PASSWORD_RESET_CODE_TTL_SECONDS=600,
+    PASSWORD_RESET_CODE_MAX_ATTEMPTS=5,
     EMAIL_VERIFICATION_SUCCESS_URL="",
     EMAIL_VERIFICATION_ERROR_URL="",
     MP_ACCESS_TOKEN="",
@@ -443,6 +452,152 @@ class AdminAuthTests(TestCase):
         self.assertEqual(response.status_code, 202)
         self.assertFalse(User.objects.filter(email="viejo-pendiente@example.com").exists())
         self.assertTrue(PendingRegistration.objects.filter(email="viejo-pendiente@example.com").exists())
+
+    def test_register_existing_verified_email_suggests_password_recovery(self):
+        self.create_verified_user("repetido@example.com", name="Cliente Repetido")
+
+        response = self.client.post(
+            "/api/auth/register",
+            {
+                "name": "Otro Nombre",
+                "email": "repetido@example.com",
+                "password": "cliente123",
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertTrue(response.data["recoverPassword"])
+        self.assertEqual(response.data["email"], "repetido@example.com")
+
+    @override_settings(RESEND_API_KEY="re_test")
+    @patch("api.views.make_registration_code", return_value="123456")
+    @patch("api.email_service.requests.post")
+    def test_public_register_ignores_stale_unverified_bearer_token(self, mocked_post, mocked_code):
+        stale_user = User.objects.create(
+            username="stale-token@example.com",
+            email="stale-token@example.com",
+            first_name="Stale Token",
+            password=make_password("cliente123"),
+            email_verified=False,
+        )
+        token = str(AccessToken.for_user(stale_user))
+
+        mocked_response = Mock()
+        mocked_response.status_code = 200
+        mocked_response.json.return_value = {"id": "email_123"}
+        mocked_post.return_value = mocked_response
+
+        response = self.client.post(
+            "/api/auth/register",
+            {
+                "name": "Cliente Nuevo",
+                "email": "cliente-nuevo@example.com",
+                "password": "cliente123",
+            },
+            format="json",
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+
+        self.assertEqual(response.status_code, 202)
+        self.assertTrue(PendingRegistration.objects.filter(email="cliente-nuevo@example.com").exists())
+
+    @override_settings(RESEND_API_KEY="re_test")
+    @patch("api.views.make_registration_code", return_value="654321")
+    @patch("api.email_service.requests.post")
+    def test_password_reset_sends_code_for_verified_user(self, mocked_post, mocked_code):
+        self.create_verified_user("recuperar@example.com", name="Cliente Recuperar")
+        mocked_response = Mock()
+        mocked_response.status_code = 200
+        mocked_response.json.return_value = {"id": "email_reset_123"}
+        mocked_post.return_value = mocked_response
+
+        response = self.client.post(
+            "/api/auth/password-reset/request",
+            {"email": "recuperar@example.com"},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.data["emailSent"])
+        self.assertTrue(PasswordResetRequest.objects.filter(email="recuperar@example.com").exists())
+        payload = mocked_post.call_args.kwargs["json"]
+        self.assertEqual(payload["to"], ["recuperar@example.com"])
+        self.assertIn("654321", payload["html"])
+
+    @override_settings(RESEND_API_KEY="re_test")
+    @patch("api.views.make_registration_code", return_value="654321")
+    @patch("api.email_service.requests.post")
+    def test_password_reset_confirm_changes_password(self, mocked_post, mocked_code):
+        user = self.create_verified_user("reset-ok@example.com", password="vieja123")
+        mocked_response = Mock()
+        mocked_response.status_code = 200
+        mocked_response.json.return_value = {"id": "email_reset_123"}
+        mocked_post.return_value = mocked_response
+
+        request_response = self.client.post(
+            "/api/auth/password-reset/request",
+            {"email": "reset-ok@example.com"},
+            format="json",
+        )
+        self.assertEqual(request_response.status_code, 200)
+
+        confirm_response = self.client.post(
+            "/api/auth/password-reset/confirm",
+            {
+                "email": "reset-ok@example.com",
+                "code": "654321",
+                "password": "nueva123",
+            },
+            format="json",
+        )
+
+        self.assertEqual(confirm_response.status_code, 200)
+        user.refresh_from_db()
+        self.assertFalse(user.check_password("vieja123"))
+        self.assertTrue(user.check_password("nueva123"))
+        self.assertFalse(
+            PasswordResetRequest.objects.filter(
+                email="reset-ok@example.com",
+                used_at__isnull=True,
+            ).exists()
+        )
+
+        old_login = self.login_user("reset-ok@example.com", "vieja123")
+        self.assertEqual(old_login.status_code, 401)
+        new_login = self.login_user("reset-ok@example.com", "nueva123")
+        self.assertEqual(new_login.status_code, 200)
+
+    @override_settings(RESEND_API_KEY="re_test")
+    @patch("api.views.make_registration_code", return_value="654321")
+    @patch("api.email_service.requests.post")
+    def test_password_reset_wrong_code_increments_attempts(self, mocked_post, mocked_code):
+        self.create_verified_user("reset-wrong@example.com")
+        mocked_response = Mock()
+        mocked_response.status_code = 200
+        mocked_response.json.return_value = {"id": "email_reset_123"}
+        mocked_post.return_value = mocked_response
+
+        self.client.post(
+            "/api/auth/password-reset/request",
+            {"email": "reset-wrong@example.com"},
+            format="json",
+        )
+
+        response = self.client.post(
+            "/api/auth/password-reset/confirm",
+            {
+                "email": "reset-wrong@example.com",
+                "code": "111111",
+                "password": "nueva123",
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.data["attemptsRemaining"], 4)
+        reset_request = PasswordResetRequest.objects.get(email="reset-wrong@example.com")
+        self.assertEqual(reset_request.attempts, 1)
 
     def test_bearer_token_authenticates_user_requests(self):
         self.create_verified_user("cliente-token@example.com", name="Cliente Token")

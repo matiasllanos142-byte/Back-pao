@@ -1,6 +1,15 @@
 from django.contrib import admin
 from django.contrib.auth.admin import UserAdmin as BaseUserAdmin
-from .models import User, Category, Product, Order, OrderItem, CloudinarySettings, PendingRegistration
+from .models import (
+    User,
+    Category,
+    Product,
+    Order,
+    OrderItem,
+    CloudinarySettings,
+    PasswordResetRequest,
+    PendingRegistration,
+)
 
 
 @admin.register(User)
@@ -46,6 +55,13 @@ class CloudinarySettingsAdmin(admin.ModelAdmin):
 class PendingRegistrationAdmin(admin.ModelAdmin):
     list_display = ["email", "name", "attempts", "expires_at", "created_at"]
     search_fields = ["email", "name"]
+    readonly_fields = ["created_at", "updated_at"]
+
+
+@admin.register(PasswordResetRequest)
+class PasswordResetRequestAdmin(admin.ModelAdmin):
+    list_display = ["email", "attempts", "used_at", "expires_at", "created_at"]
+    search_fields = ["email", "user__email"]
     readonly_fields = ["created_at", "updated_at"]
 
 

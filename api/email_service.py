@@ -237,3 +237,75 @@ def send_registration_code_email(name, email, code):
             "text": text,
         }
     )
+
+
+def send_password_reset_code_email(name, email, code):
+    safe_name = escape(name or "familia")
+    safe_code = escape(code)
+
+    subject = f"Tu codigo para recuperar la contrasena es {code}"
+    html = f"""
+    <div style="margin:0;padding:0;background:#f7f3f7;font-family:Arial,sans-serif;color:#111827">
+      <div style="max-width:640px;margin:0 auto;padding:32px 16px">
+        <div style="background:#ffffff;border:1px solid #e5e7eb;border-radius:22px;overflow:hidden">
+          <div style="background:#3F87EC;padding:28px;color:#ffffff">
+            <p style="margin:0 0 8px;font-size:12px;font-weight:700;letter-spacing:2px;text-transform:uppercase">
+              Lic. Paola Zabala
+            </p>
+            <h1 style="margin:0;font-size:28px;line-height:1.2">
+              Recupera tu acceso
+            </h1>
+          </div>
+
+          <div style="padding:30px;line-height:1.65">
+            <p style="margin:0 0 14px;font-size:16px">Hola {safe_name},</p>
+            <p style="margin:0 0 18px;font-size:16px">
+              Recibimos una solicitud para cambiar la contrasena de tu cuenta en Paola Psicope.
+              Ingresa este codigo en la pagina de recuperacion:
+            </p>
+
+            <div style="margin:0 0 24px;text-align:center">
+              <div style="display:inline-block;background:#eff6ff;border:1px solid #bfdbfe;border-radius:18px;padding:18px 26px">
+                <p style="margin:0;color:#1d4ed8;font-size:34px;font-weight:800;letter-spacing:8px">
+                  {safe_code}
+                </p>
+              </div>
+            </div>
+
+            <div style="background:#f8fafc;border-radius:14px;padding:16px 18px;margin:0 0 22px">
+              <p style="margin:0;font-size:14px;color:#475569">
+                Tu biblioteca y tus compras quedan asociadas a este email. La contrasena solo cambia si este codigo es correcto.
+              </p>
+            </div>
+
+            <p style="margin:0 0 10px;font-size:14px;color:#6b7280">
+              Si no pediste recuperar la cuenta, ignora este email. Nadie podra entrar sin el codigo.
+            </p>
+            <p style="margin:0;font-size:14px;color:#6b7280">
+              Este codigo vence en unos minutos.
+            </p>
+          </div>
+
+          <div style="padding:18px 28px;background:#fafafa;border-top:1px solid #e5e7eb">
+            <p style="margin:0;font-size:13px;color:#6b7280">
+              Paola Psicope - Consultorio psicopedagogico - @paola_psicope
+            </p>
+          </div>
+        </div>
+      </div>
+    </div>
+    """
+    text = (
+        f"Hola {name or ''},\n\n"
+        f"Tu codigo para recuperar la contrasena en Paola Psicope es: {code}\n\n"
+        "Si no pediste recuperar la cuenta, ignora este mensaje."
+    )
+
+    return send_resend_email(
+        {
+            "to": email,
+            "subject": subject,
+            "html": html,
+            "text": text,
+        }
+    )

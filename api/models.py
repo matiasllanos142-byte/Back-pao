@@ -49,6 +49,33 @@ class PendingRegistration(models.Model):
         return timezone.now() >= self.expires_at
 
 
+class PasswordResetRequest(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name="password_reset_requests")
+    email = models.EmailField()
+    verification_code_hash = models.CharField(max_length=200)
+    attempts = models.PositiveSmallIntegerField(default=0)
+    used_at = models.DateTimeField(blank=True, null=True)
+    expires_at = models.DateTimeField()
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "password_reset_requests"
+        indexes = [
+            models.Index(fields=["email", "created_at"]),
+        ]
+
+    def __str__(self):
+        return self.email
+
+    def is_expired(self):
+        return timezone.now() >= self.expires_at
+
+    def is_usable(self):
+        return self.used_at is None and not self.is_expired()
+
+
 class Category(models.Model):
     slug = models.SlugField(primary_key=True, max_length=100)
     name = models.CharField(max_length=200)
