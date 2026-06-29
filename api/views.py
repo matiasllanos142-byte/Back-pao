@@ -78,7 +78,7 @@ def set_auth_cookie(response, user, token=None):
 
 
 def clear_auth_cookie(response):
-    response.delete_cookie(COOKIE_NAME)
+    response.delete_cookie(COOKIE_NAME, samesite=settings.AUTH_COOKIE_SAMESITE)
     return response
 
 
@@ -111,8 +111,18 @@ def register_view(request):
     name = serializer.validated_data.get("name") or serializer.validated_data.get("first_name", "")
     password = serializer.validated_data["password"]
 
-    if User.objects.filter(email=email).exists():
-        return Response({"error": "Ya existe una cuenta con este email."}, status=status.HTTP_400_BAD_REQUEST)
+    existing_user = User.objects.filter(email=email).first()
+    if existing_user:
+        if existing_user.email_verified:
+            return Response({"error": "Ya existe una cuenta con este email."}, status=status.HTTP_400_BAD_REQUEST)
+        if existing_user.purchased_products.exists() or existing_user.orders.exists():
+            return Response(
+                {
+                    "error": "Este email tiene una cuenta pendiente con actividad asociada. Contactanos para revisarla."
+                },
+                status=status.HTTP_409_CONFLICT,
+            )
+        existing_user.delete()
 
     code = make_registration_code()
     try:
@@ -320,6 +330,15 @@ def login_view(request):
 
     if not user.check_password(password):
         return Response({"error": "Email o contraseña incorrectos."}, status=status.HTTP_401_UNAUTHORIZED)
+
+    if not user.email_verified:
+        response = Response(
+            {
+                "error": "Este email todavia no esta verificado. Volve a registrarte para recibir un codigo nuevo."
+            },
+            status=status.HTTP_403_FORBIDDEN,
+        )
+        return clear_auth_cookie(response)
 
     token = make_auth_token(user)
     response = Response({"user": UserSerializer(user).data, "accessToken": token})

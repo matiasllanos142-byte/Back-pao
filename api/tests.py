@@ -4,6 +4,7 @@ from django.core.files.uploadedfile import SimpleUploadedFile
 from django.utils import timezone
 from unittest.mock import Mock, patch
 from rest_framework.test import APIClient
+from rest_framework_simplejwt.tokens import AccessToken
 
 from .models import Category, PendingRegistration, Product, PurchasedProduct, User
 from .email_service import make_email_verification_token
@@ -60,6 +61,63 @@ class AdminAuthTests(TestCase):
             {"email": email, "password": password},
             format="json",
         )
+
+    def test_unverified_user_cannot_login(self):
+        User.objects.create(
+            username="pendiente@test.com",
+            email="pendiente@test.com",
+            first_name="Pendiente",
+            password=make_password("cliente123"),
+            email_verified=False,
+        )
+
+        response = self.client.post(
+            "/api/auth/login",
+            {"email": "pendiente@test.com", "password": "cliente123"},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 403)
+        self.assertNotIn("accessToken", response.data)
+        self.assertIn("session", response.cookies)
+        self.assertEqual(response.cookies["session"].value, "")
+
+    def test_unverified_user_token_cannot_authenticate(self):
+        user = User.objects.create(
+            username="token-pendiente@test.com",
+            email="token-pendiente@test.com",
+            first_name="Token Pendiente",
+            password=make_password("cliente123"),
+            email_verified=False,
+        )
+        token = str(AccessToken.for_user(user))
+
+        response = self.client.get(
+            "/api/auth/me",
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+
+        self.assertEqual(response.status_code, 401)
+
+    def test_logout_clears_cookie_even_with_unverified_token(self):
+        user = User.objects.create(
+            username="logout-pendiente@test.com",
+            email="logout-pendiente@test.com",
+            first_name="Logout Pendiente",
+            password=make_password("cliente123"),
+            email_verified=False,
+        )
+        token = str(AccessToken.for_user(user))
+        self.client.cookies["session"] = token
+
+        response = self.client.post(
+            "/api/auth/logout",
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("session", response.cookies)
+        self.assertEqual(response.cookies["session"].value, "")
 
     def test_admin_login_rejects_invalid_credentials(self):
         response = self.client.post(
@@ -355,6 +413,36 @@ class AdminAuthTests(TestCase):
         self.assertEqual(response.status_code, 502)
         self.assertFalse(User.objects.filter(email="rechazado@example.com").exists())
         self.assertFalse(PendingRegistration.objects.filter(email="rechazado@example.com").exists())
+
+    @override_settings(RESEND_API_KEY="re_test")
+    @patch("api.views.make_registration_code", return_value="123456")
+    @patch("api.email_service.requests.post")
+    def test_register_replaces_incomplete_unverified_user(self, mocked_post, mocked_code):
+        User.objects.create(
+            username="viejo-pendiente@example.com",
+            email="viejo-pendiente@example.com",
+            first_name="Viejo Pendiente",
+            password=make_password("cliente123"),
+            email_verified=False,
+        )
+        mocked_response = Mock()
+        mocked_response.status_code = 200
+        mocked_response.json.return_value = {"id": "email_123"}
+        mocked_post.return_value = mocked_response
+
+        response = self.client.post(
+            "/api/auth/register",
+            {
+                "name": "Registro Nuevo",
+                "email": "viejo-pendiente@example.com",
+                "password": "nuevo123",
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 202)
+        self.assertFalse(User.objects.filter(email="viejo-pendiente@example.com").exists())
+        self.assertTrue(PendingRegistration.objects.filter(email="viejo-pendiente@example.com").exists())
 
     def test_bearer_token_authenticates_user_requests(self):
         self.create_verified_user("cliente-token@example.com", name="Cliente Token")
