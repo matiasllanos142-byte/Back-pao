@@ -78,6 +78,7 @@ def safe_nvidia_settings(instance=None):
             "workbookSkill": instance.workbook_skill or default_workbook_skill(),
             "workbookPlanModel": instance.workbook_plan_model or default_workbook_plan_model(),
             "workbookBuildModel": instance.workbook_build_model or default_workbook_build_model(),
+            "modelCatalog": safe_nvidia_model_catalog(instance),
             "updatedAt": instance.updated_at,
         }
 
@@ -91,7 +92,30 @@ def safe_nvidia_settings(instance=None):
         "workbookSkill": default_workbook_skill(),
         "workbookPlanModel": default_workbook_plan_model(),
         "workbookBuildModel": default_workbook_build_model(),
+        "modelCatalog": safe_nvidia_model_catalog(None),
         "updatedAt": None,
+    }
+
+
+def safe_nvidia_model_catalog(instance=None):
+    instance = instance if instance is not None else get_saved_nvidia_settings()
+    if not instance:
+        return {
+            "authorized": bool(getattr(settings, "NVIDIA_API_KEY", "")),
+            "refreshedAt": None,
+            "lastError": "",
+            "models": [],
+            "roles": {},
+        }
+
+    catalog = instance.model_catalog if isinstance(instance.model_catalog, dict) else {}
+    models = catalog.get("models") if isinstance(catalog.get("models"), list) else []
+    return {
+        "authorized": bool(instance.api_key_encrypted or getattr(settings, "NVIDIA_API_KEY", "")),
+        "refreshedAt": instance.model_catalog_refreshed_at,
+        "lastError": instance.model_catalog_last_error,
+        "models": models,
+        "roles": instance.model_roles if isinstance(instance.model_roles, dict) else {},
     }
 
 
@@ -110,6 +134,7 @@ def get_nvidia_credentials():
                 "workbook_skill": instance.workbook_skill or default_workbook_skill(),
                 "workbook_plan_model": instance.workbook_plan_model or default_workbook_plan_model(),
                 "workbook_build_model": instance.workbook_build_model or default_workbook_build_model(),
+                "model_roles": instance.model_roles if isinstance(instance.model_roles, dict) else {},
             }
 
     if env_api_key:
@@ -121,6 +146,7 @@ def get_nvidia_credentials():
             "workbook_skill": default_workbook_skill(),
             "workbook_plan_model": default_workbook_plan_model(),
             "workbook_build_model": default_workbook_build_model(),
+            "model_roles": {},
         }
 
     return None

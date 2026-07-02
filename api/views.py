@@ -29,6 +29,7 @@ logger = logging.getLogger(__name__)
 
 from .models import (
     Category,
+    NvidiaSettings,
     Product,
     Order,
     OrderItem,
@@ -69,11 +70,14 @@ from .cloudinary_settings import (
     save_cloudinary_settings,
 )
 from .nvidia_settings import (
+    get_saved_nvidia_settings,
     get_nvidia_credentials,
     resolve_nvidia_credentials,
+    safe_nvidia_model_catalog,
     safe_nvidia_settings,
     save_nvidia_settings,
 )
+from .nvidia_client import build_roles, chat_completion, extract_json_object, list_nvidia_models
 from .workbook_generator import build_workbook_plan, infer_workbook_payload_from_chat
 from .workbook_pdf import render_workbook_pdf
 
@@ -722,6 +726,114 @@ def admin_nvidia_settings_test_view(request):
     return Response({"ok": True, "modelCount": len(models) if isinstance(models, list) else 0})
 
 
+def _get_or_create_nvidia_settings_for_catalog(credentials):
+    instance = get_saved_nvidia_settings()
+    if instance:
+        return instance
+    instance = NvidiaSettings.objects.create(
+        id="nvidia",
+        base_url=credentials.get("base_url") or "https://integrate.api.nvidia.com/v1",
+        model=credentials.get("model", ""),
+        image_model=credentials.get("image_model", ""),
+        workbook_skill=credentials.get("workbook_skill", ""),
+        workbook_plan_model=credentials.get("workbook_plan_model", ""),
+        workbook_build_model=credentials.get("workbook_build_model", ""),
+    )
+    return instance
+
+
+@api_view(["GET"])
+@permission_classes([IsEnvAdmin])
+def admin_nvidia_models_view(request):
+    return Response({"catalog": safe_nvidia_model_catalog()})
+
+
+@api_view(["POST"])
+@permission_classes([IsEnvAdmin])
+def admin_nvidia_models_refresh_view(request):
+    credentials = resolve_nvidia_credentials(request.data)
+    if not credentials:
+        return Response(
+            {"error": "Completa y guarda la API key de NVIDIA antes de refrescar modelos."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    instance = _get_or_create_nvidia_settings_for_catalog(credentials)
+    try:
+        models = list_nvidia_models(credentials["base_url"], credentials["api_key"])
+    except requests.HTTPError as exc:
+        response = exc.response
+        instance.model_catalog_last_error = nvidia_error(response, "NVIDIA rechazo la consulta de modelos.") if response else str(exc)
+        instance.save(update_fields=["model_catalog_last_error", "updated_at"])
+        return Response({"error": instance.model_catalog_last_error}, status=status.HTTP_400_BAD_REQUEST)
+    except requests.RequestException:
+        instance.model_catalog_last_error = "No se pudo consultar el catalogo de modelos NVIDIA."
+        instance.save(update_fields=["model_catalog_last_error", "updated_at"])
+        return Response({"error": instance.model_catalog_last_error}, status=status.HTTP_502_BAD_GATEWAY)
+
+    roles = build_roles(models, instance.model_roles if isinstance(instance.model_roles, dict) else {})
+    instance.model_catalog = {"models": models}
+    instance.model_roles = roles
+    instance.model_catalog_refreshed_at = timezone.now()
+    instance.model_catalog_last_error = ""
+    if not instance.model and roles.get("orchestrator"):
+        instance.model = roles["orchestrator"]
+    if not instance.workbook_plan_model and roles.get("planner"):
+        instance.workbook_plan_model = roles["planner"]
+    if not instance.workbook_build_model and roles.get("builder"):
+        instance.workbook_build_model = roles["builder"]
+    if not instance.image_model and roles.get("image"):
+        instance.image_model = roles["image"]
+    instance.save(
+        update_fields=[
+            "model_catalog",
+            "model_roles",
+            "model_catalog_refreshed_at",
+            "model_catalog_last_error",
+            "model",
+            "workbook_plan_model",
+            "workbook_build_model",
+            "image_model",
+            "updated_at",
+        ]
+    )
+    return Response({"catalog": safe_nvidia_model_catalog(instance), "nvidia": safe_nvidia_settings(instance)})
+
+
+@api_view(["PUT"])
+@permission_classes([IsEnvAdmin])
+def admin_nvidia_orchestrator_view(request):
+    instance = get_saved_nvidia_settings()
+    if not instance:
+        return Response(
+            {"error": "Configura NVIDIA antes de elegir modelos."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    roles = instance.model_roles if isinstance(instance.model_roles, dict) else {}
+    for key in ["orchestrator", "planner", "builder", "vision", "image", "code"]:
+        value = str(request.data.get(key, "") or "").strip()
+        if value:
+            roles[key] = value
+
+    instance.model_roles = roles
+    instance.model = roles.get("orchestrator", instance.model)
+    instance.workbook_plan_model = roles.get("planner", instance.workbook_plan_model)
+    instance.workbook_build_model = roles.get("builder", instance.workbook_build_model)
+    instance.image_model = roles.get("image", instance.image_model)
+    instance.save(
+        update_fields=[
+            "model_roles",
+            "model",
+            "workbook_plan_model",
+            "workbook_build_model",
+            "image_model",
+            "updated_at",
+        ]
+    )
+    return Response({"catalog": safe_nvidia_model_catalog(instance), "nvidia": safe_nvidia_settings(instance)})
+
+
 def safe_workbook_draft(instance):
     plan = instance.plan or {}
     return {
@@ -735,9 +847,12 @@ def safe_workbook_draft(instance):
         "style": instance.style,
         "provider": instance.provider,
         "status": instance.status,
+        "phase": plan.get("phase") or ("done" if instance.status == "done" else "planning"),
         "plan": plan,
         "pdfReady": instance.status == "done",
         "pdfUrl": f"/api/admin/workbooks/{instance.id}/pdf" if plan else "",
+        "warnings": plan.get("warnings", []),
+        "agentTrace": plan.get("agentTrace", []),
         "createdAt": instance.created_at,
         "updatedAt": instance.updated_at,
     }
@@ -766,10 +881,119 @@ def admin_workbook_list_create_view(request):
     return Response({"workbook": safe_workbook_draft(draft)}, status=status.HTTP_201_CREATED)
 
 
+def _workbook_messages_text(messages):
+    lines = []
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        role = message.get("role", "user")
+        content = str(message.get("content", "")).strip()
+        if content:
+            lines.append(f"{role}: {content}")
+    return "\n".join(lines)
+
+
+def _selected_nvidia_model(credentials, role, model_profile="auto"):
+    if model_profile and model_profile != "auto":
+        return model_profile
+    roles = credentials.get("model_roles") if isinstance(credentials.get("model_roles"), dict) else {}
+    if role == "planner":
+        return roles.get("planner") or credentials.get("workbook_plan_model") or roles.get("orchestrator") or credentials.get("model")
+    if role == "builder":
+        return roles.get("builder") or credentials.get("workbook_build_model") or roles.get("orchestrator") or credentials.get("model")
+    return roles.get("orchestrator") or credentials.get("model")
+
+
+def _try_nvidia_workbook_plan(messages, credentials, model_profile="auto"):
+    model = _selected_nvidia_model(credentials, "planner", model_profile)
+    if not credentials or not model:
+        return None, "NVIDIA no tiene un modelo de plan configurado."
+
+    skill = credentials.get("workbook_skill", "")
+    system_prompt = (
+        "Sos el agente planificador de Paola Psicope. Devolve solo JSON valido, sin markdown. "
+        "El JSON debe tener: title, brief, topic, age, difficulty, pages, style. "
+        "Si faltan datos, inferi una opcion profesional y practica. pages debe ser numero entre 8 y 140."
+    )
+    user_prompt = (
+        f"Skill fija:\n{skill}\n\nConversacion:\n{_workbook_messages_text(messages)}\n\n"
+        "Arma el payload base para un cuadernillo psicopedagogico imprimible A4."
+    )
+
+    try:
+        content = chat_completion(
+            credentials["base_url"],
+            credentials["api_key"],
+            model,
+            [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0.15,
+            max_tokens=1600,
+        )
+    except Exception as exc:
+        return None, f"NVIDIA fallo en planificacion: {exc}"
+
+    payload = extract_json_object(content)
+    if not isinstance(payload, dict):
+        return None, "NVIDIA no devolvio JSON valido para el plan."
+
+    payload["skill"] = skill
+    return payload, ""
+
+
+def _try_nvidia_build_notes(plan, credentials, model_profile="auto"):
+    model = _selected_nvidia_model(credentials, "builder", model_profile)
+    if not credentials or not model:
+        return None, "NVIDIA no tiene un modelo de build configurado."
+
+    system_prompt = (
+        "Sos el agente builder de Paola Psicope. Devolve solo JSON valido, sin markdown. "
+        "El JSON debe tener buildNotes: array de textos cortos, y visualDirection: texto breve. "
+        "No reescribas actividades completas; solo mejora guia editorial y direccion visual."
+    )
+    user_prompt = json.dumps(
+        {
+            "title": plan.get("title"),
+            "topic": plan.get("topic"),
+            "age": plan.get("age"),
+            "difficulty": plan.get("difficulty"),
+            "pages": plan.get("totalPages"),
+            "style": plan.get("style"),
+            "activities": plan.get("activities", [])[:12],
+        },
+        ensure_ascii=False,
+    )
+
+    try:
+        content = chat_completion(
+            credentials["base_url"],
+            credentials["api_key"],
+            model,
+            [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0.2,
+            max_tokens=1300,
+        )
+    except Exception as exc:
+        return None, f"NVIDIA fallo en build: {exc}"
+
+    payload = extract_json_object(content)
+    if not isinstance(payload, dict):
+        return None, "NVIDIA no devolvio JSON valido para build."
+    return payload, ""
+
+
 @api_view(["POST"])
 @permission_classes([IsEnvAdmin])
 def admin_workbook_chat_view(request):
     messages = request.data.get("messages") or []
+    mode = str(request.data.get("mode") or "plan").lower()
+    workbook_id = request.data.get("workbookId")
+    model_profile = str(request.data.get("modelProfile") or "auto").strip() or "auto"
     if not isinstance(messages, list) or not messages:
         return Response(
             {"error": "Envia al menos un mensaje para armar el plan."},
@@ -778,8 +1002,58 @@ def admin_workbook_chat_view(request):
 
     credentials = get_nvidia_credentials() or {}
     skill_text = credentials.get("workbook_skill", "")
-    payload = infer_workbook_payload_from_chat(messages, skill_text=skill_text)
+    warnings = []
+    agent_trace = []
+
+    if mode == "build" and workbook_id:
+        draft = get_object_or_404(WorkbookDraft, pk=workbook_id)
+        draft.status = "done"
+        draft.plan = {
+            **(draft.plan or {}),
+            "phase": "done",
+            "pdfGeneratedAt": timezone.now().isoformat(),
+            "agentTrace": [
+                *((draft.plan or {}).get("agentTrace", [])),
+                {"agent": "builder", "status": "done", "model": "local-pdf"},
+            ],
+        }
+        draft.save(update_fields=["status", "plan", "updated_at"])
+        return Response(
+            {
+                "reply": "Build terminado. El PDF A4 quedo listo para descargar.",
+                "phase": "done",
+                "pdfReady": True,
+                "warnings": [],
+                "agentTrace": draft.plan.get("agentTrace", []),
+                "workbook": safe_workbook_draft(draft),
+            }
+        )
+
+    payload = None
+    if credentials:
+        payload, nvidia_warning = _try_nvidia_workbook_plan(messages, credentials, model_profile)
+        if payload:
+            agent_trace.append(
+                {
+                    "agent": "planner",
+                    "status": "ok",
+                    "model": _selected_nvidia_model(credentials, "planner", model_profile),
+                }
+            )
+        elif nvidia_warning:
+            warnings.append(nvidia_warning)
+
+    if not payload:
+        payload = infer_workbook_payload_from_chat(messages, skill_text=skill_text)
+        agent_trace.append({"agent": "planner", "status": "fallback", "model": "local-dataset"})
+
     plan = build_workbook_plan(payload)
+    plan = {
+        **plan,
+        "phase": "planning",
+        "warnings": warnings,
+        "agentTrace": agent_trace,
+    }
     draft = WorkbookDraft.objects.create(
         title=plan["title"],
         brief=plan["brief"],
@@ -788,7 +1062,7 @@ def admin_workbook_chat_view(request):
         difficulty=plan["difficulty"],
         pages=plan["requestedPages"],
         style=plan["style"],
-        provider="workbook-skill",
+        provider="nvidia-orchestrator" if credentials and not any(item.get("status") == "fallback" for item in agent_trace) else "local-dataset",
         status="planned",
         plan=plan,
     )
@@ -805,6 +1079,10 @@ def admin_workbook_chat_view(request):
                 "planModel": credentials.get("workbook_plan_model", ""),
                 "buildModel": credentials.get("workbook_build_model", ""),
             },
+            "phase": "planning",
+            "pdfReady": False,
+            "warnings": warnings,
+            "agentTrace": agent_trace,
             "workbook": safe_workbook_draft(draft),
         },
         status=status.HTTP_201_CREATED,
@@ -821,13 +1099,47 @@ def admin_workbook_build_view(request, pk):
             status=status.HTTP_400_BAD_REQUEST,
         )
 
+    credentials = get_nvidia_credentials() or {}
+    model_profile = str(request.data.get("modelProfile") or "auto").strip() or "auto"
+    warnings = list((draft.plan or {}).get("warnings", []))
+    agent_trace = list((draft.plan or {}).get("agentTrace", []))
+    build_payload = None
+    if credentials:
+        build_payload, nvidia_warning = _try_nvidia_build_notes(draft.plan, credentials, model_profile)
+        if build_payload:
+            agent_trace.append(
+                {
+                    "agent": "builder",
+                    "status": "ok",
+                    "model": _selected_nvidia_model(credentials, "builder", model_profile),
+                }
+            )
+        elif nvidia_warning:
+            warnings.append(nvidia_warning)
+            agent_trace.append({"agent": "builder", "status": "fallback", "model": "local-pdf"})
+    else:
+        agent_trace.append({"agent": "builder", "status": "fallback", "model": "local-pdf"})
+
     draft.status = "done"
     draft.plan = {
         **draft.plan,
+        "phase": "done",
+        "warnings": warnings,
+        "agentTrace": agent_trace,
+        "buildNotes": (build_payload or {}).get("buildNotes", []),
+        "visualDirection": (build_payload or {}).get("visualDirection", ""),
         "pdfGeneratedAt": timezone.now().isoformat(),
     }
     draft.save(update_fields=["status", "plan", "updated_at"])
-    return Response({"workbook": safe_workbook_draft(draft)})
+    return Response(
+        {
+            "workbook": safe_workbook_draft(draft),
+            "phase": "done",
+            "pdfReady": True,
+            "warnings": warnings,
+            "agentTrace": agent_trace,
+        }
+    )
 
 
 @api_view(["GET"])

@@ -151,6 +151,10 @@ class NvidiaSettings(models.Model):
     workbook_skill = models.TextField(blank=True)
     workbook_plan_model = models.CharField(max_length=300, blank=True)
     workbook_build_model = models.CharField(max_length=300, blank=True)
+    model_catalog = models.JSONField(default=dict, blank=True)
+    model_roles = models.JSONField(default=dict, blank=True)
+    model_catalog_refreshed_at = models.DateTimeField(blank=True, null=True)
+    model_catalog_last_error = models.TextField(blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
