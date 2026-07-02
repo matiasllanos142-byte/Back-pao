@@ -1380,9 +1380,9 @@ def create_payment_preference_view(request):
         ],
         "payer": {"name": customer_name, "email": customer_email},
         "back_urls": {
-            "success": f"{base_url}/checkout/success?order_id={order.id}",
-            "failure": f"{base_url}/checkout/failure?order_id={order.id}",
-            "pending": f"{base_url}/checkout/failure?order_id={order.id}",
+            "success": f"{base_url}/checkout/success",
+            "failure": f"{base_url}/checkout/failure",
+            "pending": f"{base_url}/checkout/failure",
         },
         "auto_return": "approved",
         "external_reference": str(order.id),

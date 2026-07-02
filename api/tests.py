@@ -841,8 +841,10 @@ class AdminAuthTests(TestCase):
         self.assertEqual(payload["external_reference"], str(order.id))
         self.assertEqual(
             payload["back_urls"]["success"],
-            f"https://workenginecorp.com.ar/checkout/success?order_id={order.id}",
+            "https://workenginecorp.com.ar/checkout/success",
         )
+        self.assertEqual(payload["back_urls"]["failure"], "https://workenginecorp.com.ar/checkout/failure")
+        self.assertEqual(payload["back_urls"]["pending"], "https://workenginecorp.com.ar/checkout/failure")
 
     @override_settings(
         MP_ACCESS_TOKEN="APP_USR-test-token",
