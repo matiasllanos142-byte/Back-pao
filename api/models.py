@@ -142,6 +142,54 @@ class CloudinarySettings(models.Model):
         return self.cloud_name
 
 
+class NvidiaSettings(models.Model):
+    id = models.CharField(primary_key=True, max_length=50, default="nvidia")
+    api_key_encrypted = models.TextField(blank=True)
+    base_url = models.URLField(max_length=500, default="https://integrate.api.nvidia.com/v1")
+    model = models.CharField(max_length=300, blank=True)
+    image_model = models.CharField(max_length=300, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "nvidia_settings"
+        verbose_name = "NVIDIA settings"
+        verbose_name_plural = "NVIDIA settings"
+
+    def __str__(self):
+        return self.base_url
+
+
+class WorkbookDraft(models.Model):
+    STATUS_CHOICES = [
+        ("planned", "Planned"),
+        ("building", "Building"),
+        ("done", "Done"),
+        ("error", "Error"),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    title = models.CharField(max_length=300)
+    brief = models.TextField(blank=True)
+    topic = models.CharField(max_length=200, blank=True)
+    age = models.CharField(max_length=100, blank=True)
+    difficulty = models.CharField(max_length=100, blank=True)
+    pages = models.PositiveIntegerField(default=20)
+    style = models.CharField(max_length=200, blank=True)
+    provider = models.CharField(max_length=100, default="local")
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="planned")
+    plan = models.JSONField(default=dict, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "workbook_drafts"
+        ordering = ["-created_at"]
+
+    def __str__(self):
+        return self.title
+
+
 class PurchasedProduct(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     user = models.ForeignKey(

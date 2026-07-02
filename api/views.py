@@ -31,6 +31,7 @@ from .models import (
     PasswordResetRequest,
     PendingRegistration,
     PurchasedProduct,
+    WorkbookDraft,
 )
 from .serializers import (
     UserSerializer,
@@ -63,6 +64,12 @@ from .cloudinary_settings import (
     safe_cloudinary_settings,
     save_cloudinary_settings,
 )
+from .nvidia_settings import (
+    resolve_nvidia_credentials,
+    safe_nvidia_settings,
+    save_nvidia_settings,
+)
+from .workbook_generator import build_workbook_plan
 
 User = get_user_model()
 
@@ -623,6 +630,125 @@ def admin_cloudinary_settings_test_view(request):
         )
 
     return Response({"ok": True})
+
+
+def nvidia_error(response, fallback):
+    try:
+        data = response.json()
+        if isinstance(data, dict):
+            error = data.get("error")
+            if isinstance(error, dict):
+                return error.get("message") or fallback
+            if isinstance(error, str):
+                return error
+            return data.get("message") or fallback
+        return fallback
+    except ValueError:
+        return fallback
+
+
+@api_view(["GET", "PUT"])
+@permission_classes([IsEnvAdmin])
+def admin_nvidia_settings_view(request):
+    if request.method == "GET":
+        return Response({"nvidia": safe_nvidia_settings()})
+
+    base_url = request.data.get("baseUrl", "").strip()
+    model = request.data.get("model", "").strip()
+    image_model = request.data.get("imageModel", "").strip()
+    api_key = request.data.get("apiKey", "").strip()
+
+    if not base_url:
+        return Response(
+            {"error": "La URL base de NVIDIA es obligatoria."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    instance = save_nvidia_settings(
+        base_url=base_url,
+        model=model,
+        image_model=image_model,
+        api_key=api_key or None,
+    )
+    return Response({"nvidia": safe_nvidia_settings(instance)})
+
+
+@api_view(["POST"])
+@permission_classes([IsEnvAdmin])
+def admin_nvidia_settings_test_view(request):
+    credentials = resolve_nvidia_credentials(request.data)
+    if not credentials:
+        return Response(
+            {"error": "Completa la API key de NVIDIA."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    models_url = f"{credentials['base_url'].rstrip('/')}/models"
+    try:
+        response = requests.get(
+            models_url,
+            headers={"Authorization": f"Bearer {credentials['api_key']}"},
+            timeout=20,
+        )
+    except requests.RequestException:
+        return Response(
+            {"error": "No se pudo validar NVIDIA."},
+            status=status.HTTP_502_BAD_GATEWAY,
+        )
+
+    if response.status_code >= 400:
+        return Response(
+            {"error": nvidia_error(response, "NVIDIA rechazo las credenciales.")},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    try:
+        data = response.json()
+    except ValueError:
+        data = {}
+    models = data.get("data") if isinstance(data, dict) else []
+    return Response({"ok": True, "modelCount": len(models) if isinstance(models, list) else 0})
+
+
+def safe_workbook_draft(instance):
+    return {
+        "id": str(instance.id),
+        "title": instance.title,
+        "brief": instance.brief,
+        "topic": instance.topic,
+        "age": instance.age,
+        "difficulty": instance.difficulty,
+        "pages": instance.pages,
+        "style": instance.style,
+        "provider": instance.provider,
+        "status": instance.status,
+        "plan": instance.plan,
+        "createdAt": instance.created_at,
+        "updatedAt": instance.updated_at,
+    }
+
+
+@api_view(["GET", "POST"])
+@permission_classes([IsEnvAdmin])
+def admin_workbook_list_create_view(request):
+    if request.method == "GET":
+        drafts = WorkbookDraft.objects.all()[:20]
+        return Response({"workbooks": [safe_workbook_draft(draft) for draft in drafts]})
+
+    plan = build_workbook_plan(request.data)
+    draft = WorkbookDraft.objects.create(
+        title=plan["title"],
+        brief=plan["brief"],
+        topic=plan["topic"],
+        age=plan["age"],
+        difficulty=plan["difficulty"],
+        pages=plan["requestedPages"],
+        style=plan["style"],
+        provider="local-dataset",
+        status="planned",
+        plan=plan,
+    )
+    return Response({"workbook": safe_workbook_draft(draft)}, status=status.HTTP_201_CREATED)
 
 
 def grant_order_access(order):

@@ -56,6 +56,14 @@ CLOUDINARY_MAX_UPLOAD_BYTES = int(os.environ.get("CLOUDINARY_MAX_UPLOAD_BYTES", 
 CLOUDINARY_DOWNLOAD_FOLDER = os.environ.get("CLOUDINARY_DOWNLOAD_FOLDER", "paola-psicope/downloads")
 CLOUDINARY_MAX_DOWNLOAD_BYTES = int(os.environ.get("CLOUDINARY_MAX_DOWNLOAD_BYTES", str(25 * 1024 * 1024)))
 
+NVIDIA_API_KEY = os.environ.get("NVIDIA_API_KEY", "")
+NVIDIA_SETTINGS_SECRET = os.environ.get("NVIDIA_SETTINGS_SECRET", SECRET_KEY)
+NVIDIA_BASE_URL = url_with_default_scheme(
+    os.environ.get("NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1")
+)
+NVIDIA_MODEL = os.environ.get("NVIDIA_MODEL", "")
+NVIDIA_IMAGE_MODEL = os.environ.get("NVIDIA_IMAGE_MODEL", "")
+
 BACKEND_PUBLIC_URL = url_with_default_scheme(os.environ.get("BACKEND_PUBLIC_URL", ""))
 RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
 RESEND_FROM_EMAIL = os.environ.get("RESEND_FROM_EMAIL", "Paola Psicopé <onboarding@resend.dev>")
