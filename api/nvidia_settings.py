@@ -51,6 +51,18 @@ def default_nvidia_image_model():
     return getattr(settings, "NVIDIA_IMAGE_MODEL", "")
 
 
+def default_workbook_skill():
+    return getattr(settings, "NVIDIA_WORKBOOK_SKILL", "")
+
+
+def default_workbook_plan_model():
+    return getattr(settings, "NVIDIA_WORKBOOK_PLAN_MODEL", "") or default_nvidia_model()
+
+
+def default_workbook_build_model():
+    return getattr(settings, "NVIDIA_WORKBOOK_BUILD_MODEL", "") or default_nvidia_model()
+
+
 def safe_nvidia_settings(instance=None):
     instance = instance if instance is not None else get_saved_nvidia_settings()
     env_api_key = getattr(settings, "NVIDIA_API_KEY", "")
@@ -63,6 +75,9 @@ def safe_nvidia_settings(instance=None):
             "baseUrl": instance.base_url or default_nvidia_base_url(),
             "model": instance.model or default_nvidia_model(),
             "imageModel": instance.image_model or default_nvidia_image_model(),
+            "workbookSkill": instance.workbook_skill or default_workbook_skill(),
+            "workbookPlanModel": instance.workbook_plan_model or default_workbook_plan_model(),
+            "workbookBuildModel": instance.workbook_build_model or default_workbook_build_model(),
             "updatedAt": instance.updated_at,
         }
 
@@ -73,6 +88,9 @@ def safe_nvidia_settings(instance=None):
         "baseUrl": default_nvidia_base_url(),
         "model": default_nvidia_model(),
         "imageModel": default_nvidia_image_model(),
+        "workbookSkill": default_workbook_skill(),
+        "workbookPlanModel": default_workbook_plan_model(),
+        "workbookBuildModel": default_workbook_build_model(),
         "updatedAt": None,
     }
 
@@ -89,6 +107,9 @@ def get_nvidia_credentials():
                 "base_url": instance.base_url or default_nvidia_base_url(),
                 "model": instance.model or default_nvidia_model(),
                 "image_model": instance.image_model or default_nvidia_image_model(),
+                "workbook_skill": instance.workbook_skill or default_workbook_skill(),
+                "workbook_plan_model": instance.workbook_plan_model or default_workbook_plan_model(),
+                "workbook_build_model": instance.workbook_build_model or default_workbook_build_model(),
             }
 
     if env_api_key:
@@ -97,12 +118,23 @@ def get_nvidia_credentials():
             "base_url": default_nvidia_base_url(),
             "model": default_nvidia_model(),
             "image_model": default_nvidia_image_model(),
+            "workbook_skill": default_workbook_skill(),
+            "workbook_plan_model": default_workbook_plan_model(),
+            "workbook_build_model": default_workbook_build_model(),
         }
 
     return None
 
 
-def save_nvidia_settings(base_url, model="", image_model="", api_key=None):
+def save_nvidia_settings(
+    base_url,
+    model="",
+    image_model="",
+    api_key=None,
+    workbook_skill="",
+    workbook_plan_model="",
+    workbook_build_model="",
+):
     instance = get_saved_nvidia_settings()
     encrypted_key = encrypt_api_key(api_key) if api_key else None
 
@@ -116,6 +148,9 @@ def save_nvidia_settings(base_url, model="", image_model="", api_key=None):
             "base_url": base_url or default_nvidia_base_url(),
             "model": model,
             "image_model": image_model,
+            "workbook_skill": workbook_skill,
+            "workbook_plan_model": workbook_plan_model,
+            "workbook_build_model": workbook_build_model,
         },
     )
     return instance
@@ -130,6 +165,18 @@ def resolve_nvidia_credentials(payload):
         "image_model",
         default_nvidia_image_model(),
     )
+    workbook_skill = (payload.get("workbookSkill") or "").strip() or (saved or {}).get(
+        "workbook_skill",
+        default_workbook_skill(),
+    )
+    workbook_plan_model = (payload.get("workbookPlanModel") or "").strip() or (saved or {}).get(
+        "workbook_plan_model",
+        default_workbook_plan_model(),
+    )
+    workbook_build_model = (payload.get("workbookBuildModel") or "").strip() or (saved or {}).get(
+        "workbook_build_model",
+        default_workbook_build_model(),
+    )
 
     if not api_key:
         return None
@@ -139,4 +186,7 @@ def resolve_nvidia_credentials(payload):
         "base_url": base_url,
         "model": model,
         "image_model": image_model,
+        "workbook_skill": workbook_skill,
+        "workbook_plan_model": workbook_plan_model,
+        "workbook_build_model": workbook_build_model,
     }

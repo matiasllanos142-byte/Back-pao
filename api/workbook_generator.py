@@ -1,4 +1,5 @@
 from django.utils import timezone
+import re
 
 
 ACTIVITY_LIBRARY = [
@@ -101,6 +102,79 @@ def _activity_title(base, topic, index):
     return base
 
 
+def infer_workbook_payload_from_chat(messages, skill_text=""):
+    content = "\n".join(
+        str(message.get("content", ""))
+        for message in messages
+        if isinstance(message, dict)
+    ).strip()
+    normalized = content.lower()
+
+    pages = 20
+    page_match = re.search(r"(\d{1,3})\s*(?:paginas|p[aá]ginas|hojas|actividades)", normalized)
+    if page_match:
+        pages = int(page_match.group(1))
+
+    age = ""
+    age_match = re.search(r"(\d{1,2})\s*(?:anos|a[nñ]os)", normalized)
+    if age_match:
+        age = f"{age_match.group(1)} anos"
+
+    difficulty = "Media"
+    if re.search(r"\b(facil|f[aá]cil|baja|simple)\b", normalized):
+        difficulty = "Facil"
+    elif re.search(r"\b(dificil|dif[ií]cil|alta|avanzada)\b", normalized):
+        difficulty = "Alta"
+
+    topic_keywords = [
+        ("tdah", "TDAH"),
+        ("tea", "TEA"),
+        ("autismo", "TEA / Autismo"),
+        ("discalculia", "Discalculia"),
+        ("dislexia", "Dislexia"),
+        ("lectoescritura", "Lectoescritura"),
+        ("futbol", "Funciones ejecutivas con tematica futbol"),
+        ("fútbol", "Funciones ejecutivas con tematica futbol"),
+        ("memoria", "Atencion y memoria"),
+        ("atencion", "Atencion y memoria"),
+        ("atención", "Atencion y memoria"),
+        ("funciones ejecutivas", "Funciones ejecutivas"),
+        ("habitos", "Habitos de estudio"),
+        ("hábitos", "Habitos de estudio"),
+        ("emociones", "Autorregulacion emocional"),
+    ]
+    topic = ""
+    for needle, value in topic_keywords:
+        if needle in normalized:
+            topic = value
+            break
+
+    if not topic:
+        compact = re.sub(r"\s+", " ", content)
+        topic = compact[:90] or "habilidades de aprendizaje"
+
+    title = f"Cuadernillo psicopedagogico de {topic}"
+    if age:
+        title = f"{title} - {age}"
+
+    style = "Canva educativo profesional, A4 vertical, colores claros, actividades imprimibles"
+    if "princesa" in normalized or "princesas" in normalized:
+        style = "Canva educativo con tematica de princesas, colores pastel, A4 vertical"
+    elif "futbol" in normalized or "fútbol" in normalized:
+        style = "Canva educativo deportivo, futbol infantil, colores vivos, A4 vertical"
+
+    return {
+        "title": title,
+        "brief": content,
+        "topic": topic,
+        "age": age or "edad a definir",
+        "difficulty": difficulty,
+        "pages": pages,
+        "style": style,
+        "skill": skill_text,
+    }
+
+
 def build_workbook_plan(payload):
     topic = _clean(payload.get("topic"), _clean(payload.get("brief"), "habilidades de aprendizaje"))
     age = _clean(payload.get("age"), "edad a definir")
@@ -186,6 +260,7 @@ def build_workbook_plan(payload):
         "requestedPages": pages,
         "profile": _profile_for_pages(pages),
         "style": style,
+        "skill": _clean(payload.get("skill"), ""),
         "structure": structure,
         "activities": activities,
         "imagePrompts": image_prompts,

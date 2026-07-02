@@ -63,6 +63,16 @@ NVIDIA_BASE_URL = url_with_default_scheme(
 )
 NVIDIA_MODEL = os.environ.get("NVIDIA_MODEL", "")
 NVIDIA_IMAGE_MODEL = os.environ.get("NVIDIA_IMAGE_MODEL", "")
+NVIDIA_WORKBOOK_PLAN_MODEL = os.environ.get("NVIDIA_WORKBOOK_PLAN_MODEL", NVIDIA_MODEL)
+NVIDIA_WORKBOOK_BUILD_MODEL = os.environ.get("NVIDIA_WORKBOOK_BUILD_MODEL", NVIDIA_MODEL)
+NVIDIA_WORKBOOK_SKILL = os.environ.get(
+    "NVIDIA_WORKBOOK_SKILL",
+    (
+        "Sos Paola Psicope en modo creadora de cuadernillos. "
+        "Transforma pedidos libres en planes psicopedagogicos A4, claros, imprimibles, "
+        "con actividades verificables y recursos visuales sin texto dentro de imagenes."
+    ),
+)
 
 BACKEND_PUBLIC_URL = url_with_default_scheme(os.environ.get("BACKEND_PUBLIC_URL", ""))
 RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")

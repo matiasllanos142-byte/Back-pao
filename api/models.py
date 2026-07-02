@@ -148,6 +148,9 @@ class NvidiaSettings(models.Model):
     base_url = models.URLField(max_length=500, default="https://integrate.api.nvidia.com/v1")
     model = models.CharField(max_length=300, blank=True)
     image_model = models.CharField(max_length=300, blank=True)
+    workbook_skill = models.TextField(blank=True)
+    workbook_plan_model = models.CharField(max_length=300, blank=True)
+    workbook_build_model = models.CharField(max_length=300, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 

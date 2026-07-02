@@ -65,11 +65,13 @@ from .cloudinary_settings import (
     save_cloudinary_settings,
 )
 from .nvidia_settings import (
+    get_nvidia_credentials,
     resolve_nvidia_credentials,
     safe_nvidia_settings,
     save_nvidia_settings,
 )
-from .workbook_generator import build_workbook_plan
+from .workbook_generator import build_workbook_plan, infer_workbook_payload_from_chat
+from .workbook_pdf import render_workbook_pdf
 
 User = get_user_model()
 
@@ -656,6 +658,9 @@ def admin_nvidia_settings_view(request):
     base_url = request.data.get("baseUrl", "").strip()
     model = request.data.get("model", "").strip()
     image_model = request.data.get("imageModel", "").strip()
+    workbook_skill = request.data.get("workbookSkill", "").strip()
+    workbook_plan_model = request.data.get("workbookPlanModel", "").strip()
+    workbook_build_model = request.data.get("workbookBuildModel", "").strip()
     api_key = request.data.get("apiKey", "").strip()
 
     if not base_url:
@@ -669,6 +674,9 @@ def admin_nvidia_settings_view(request):
         model=model,
         image_model=image_model,
         api_key=api_key or None,
+        workbook_skill=workbook_skill,
+        workbook_plan_model=workbook_plan_model,
+        workbook_build_model=workbook_build_model,
     )
     return Response({"nvidia": safe_nvidia_settings(instance)})
 
@@ -711,6 +719,7 @@ def admin_nvidia_settings_test_view(request):
 
 
 def safe_workbook_draft(instance):
+    plan = instance.plan or {}
     return {
         "id": str(instance.id),
         "title": instance.title,
@@ -722,7 +731,9 @@ def safe_workbook_draft(instance):
         "style": instance.style,
         "provider": instance.provider,
         "status": instance.status,
-        "plan": instance.plan,
+        "plan": plan,
+        "pdfReady": instance.status == "done",
+        "pdfUrl": f"/api/admin/workbooks/{instance.id}/pdf" if plan else "",
         "createdAt": instance.created_at,
         "updatedAt": instance.updated_at,
     }
@@ -749,6 +760,87 @@ def admin_workbook_list_create_view(request):
         plan=plan,
     )
     return Response({"workbook": safe_workbook_draft(draft)}, status=status.HTTP_201_CREATED)
+
+
+@api_view(["POST"])
+@permission_classes([IsEnvAdmin])
+def admin_workbook_chat_view(request):
+    messages = request.data.get("messages") or []
+    if not isinstance(messages, list) or not messages:
+        return Response(
+            {"error": "Envia al menos un mensaje para armar el plan."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    credentials = get_nvidia_credentials() or {}
+    skill_text = credentials.get("workbook_skill", "")
+    payload = infer_workbook_payload_from_chat(messages, skill_text=skill_text)
+    plan = build_workbook_plan(payload)
+    draft = WorkbookDraft.objects.create(
+        title=plan["title"],
+        brief=plan["brief"],
+        topic=plan["topic"],
+        age=plan["age"],
+        difficulty=plan["difficulty"],
+        pages=plan["requestedPages"],
+        style=plan["style"],
+        provider="workbook-skill",
+        status="planned",
+        plan=plan,
+    )
+    reply = (
+        f"Arme un plan de {plan['totalPages']} hojas A4 para {plan['topic']}. "
+        f"Incluye {len(plan['activities'])} actividades, estructura imprimible, registro y certificado. "
+        "Revisalo y cuando este bien toca Generar PDF."
+    )
+    return Response(
+        {
+            "reply": reply,
+            "skill": {
+                "name": "Paola Cuadernillos",
+                "planModel": credentials.get("workbook_plan_model", ""),
+                "buildModel": credentials.get("workbook_build_model", ""),
+            },
+            "workbook": safe_workbook_draft(draft),
+        },
+        status=status.HTTP_201_CREATED,
+    )
+
+
+@api_view(["POST"])
+@permission_classes([IsEnvAdmin])
+def admin_workbook_build_view(request, pk):
+    draft = get_object_or_404(WorkbookDraft, pk=pk)
+    if not draft.plan:
+        return Response(
+            {"error": "El cuadernillo no tiene plan para generar."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    draft.status = "done"
+    draft.plan = {
+        **draft.plan,
+        "pdfGeneratedAt": timezone.now().isoformat(),
+    }
+    draft.save(update_fields=["status", "plan", "updated_at"])
+    return Response({"workbook": safe_workbook_draft(draft)})
+
+
+@api_view(["GET"])
+@permission_classes([IsEnvAdmin])
+def admin_workbook_pdf_view(request, pk):
+    draft = get_object_or_404(WorkbookDraft, pk=pk)
+    if not draft.plan:
+        return Response(
+            {"error": "El cuadernillo no tiene plan para descargar."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    pdf_bytes = render_workbook_pdf(draft.plan)
+    filename = f"paola-psicope-cuadernillo-{str(draft.id)[:8]}.pdf"
+    response = HttpResponse(pdf_bytes, content_type="application/pdf")
+    response["Content-Disposition"] = f'attachment; filename="{filename}"'
+    return response
 
 
 def grant_order_access(order):
