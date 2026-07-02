@@ -831,11 +831,13 @@ class AdminAuthTests(TestCase):
         self.assertEqual(response.data["preferenceId"], "pref_123")
         order = Order.objects.get(id=response.data["orderId"])
         self.assertEqual(order.preference_id, "pref_123")
-        payload = preference.create.call_args.args[0]["body"]
+        payload = preference.create.call_args.args[0]
         self.assertEqual(
             payload["notification_url"],
             "https://backend.test/api/payments/webhook?source_news=webhooks",
         )
+        self.assertEqual(payload["items"][0]["title"], "Cuadernillo MP")
+        self.assertNotIn("body", payload)
         self.assertEqual(payload["external_reference"], str(order.id))
         self.assertEqual(
             payload["back_urls"]["success"],

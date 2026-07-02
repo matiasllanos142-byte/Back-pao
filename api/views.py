@@ -1368,31 +1368,29 @@ def create_payment_preference_view(request):
 
     notification_url = get_payment_notification_url(request)
     preference_payload = {
-        "body": {
-            "items": [
-                {
-                    "id": str(item["product"].id),
-                    "title": item["product"].title,
-                    "unit_price": float(item["product"].price),
-                    "quantity": item["quantity"],
-                    "currency_id": "ARS",
-                }
-                for item in order_items
-            ],
-            "payer": {"name": customer_name, "email": customer_email},
-            "back_urls": {
-                "success": f"{base_url}/checkout/success?order_id={order.id}",
-                "failure": f"{base_url}/checkout/failure?order_id={order.id}",
-                "pending": f"{base_url}/checkout/failure?order_id={order.id}",
-            },
-            "auto_return": "approved",
-            "external_reference": str(order.id),
-            "notification_url": notification_url,
-            "metadata": {
-                "order_id": str(order.id),
-                "user_id": str(request.user.id),
-            },
-        }
+        "items": [
+            {
+                "id": str(item["product"].id),
+                "title": item["product"].title,
+                "unit_price": float(item["product"].price),
+                "quantity": item["quantity"],
+                "currency_id": "ARS",
+            }
+            for item in order_items
+        ],
+        "payer": {"name": customer_name, "email": customer_email},
+        "back_urls": {
+            "success": f"{base_url}/checkout/success?order_id={order.id}",
+            "failure": f"{base_url}/checkout/failure?order_id={order.id}",
+            "pending": f"{base_url}/checkout/failure?order_id={order.id}",
+        },
+        "auto_return": "approved",
+        "external_reference": str(order.id),
+        "notification_url": notification_url,
+        "metadata": {
+            "order_id": str(order.id),
+            "user_id": str(request.user.id),
+        },
     }
     result = get_mercado_pago_sdk().preference().create(preference_payload)
 
