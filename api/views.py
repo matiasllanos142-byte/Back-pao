@@ -874,8 +874,28 @@ def get_mercado_pago_sdk():
 
 def mercado_pago_error_message(response_body, fallback="Mercado Pago rechazo la operacion."):
     if isinstance(response_body, dict):
-        return response_body.get("message") or response_body.get("error") or fallback
+        raw_message = response_body.get("message") or response_body.get("error") or fallback
+        if "UNAUTHORIZED" in str(raw_message).upper():
+            return (
+                "Mercado Pago rechazo la credencial configurada. "
+                "Revisa que MP_ACCESS_TOKEN sea el Access Token de produccion "
+                "de la cuenta vendedora y que la aplicacion este habilitada."
+            )
+        return raw_message
     return fallback
+
+
+def mercado_pago_response_status(status_code, response_body):
+    if not isinstance(response_body, dict):
+        return status.HTTP_502_BAD_GATEWAY
+    raw_message = f"{response_body.get('message', '')} {response_body.get('error', '')}".upper()
+    if status_code == 401 or "UNAUTHORIZED" in raw_message:
+        return status.HTTP_401_UNAUTHORIZED
+    if status_code == 403 or "FORBIDDEN" in raw_message:
+        return status.HTTP_403_FORBIDDEN
+    if 400 <= status_code < 500:
+        return status.HTTP_400_BAD_REQUEST
+    return status.HTTP_502_BAD_GATEWAY
 
 
 def validate_mercado_pago_webhook_signature(request, payment_id):
@@ -1386,7 +1406,7 @@ def create_payment_preference_view(request):
                 "error": mercado_pago_error_message(response_body),
                 "mpStatus": status_code,
             },
-            status=status.HTTP_502_BAD_GATEWAY,
+            status=mercado_pago_response_status(status_code, response_body),
         )
 
     order.preference_id = response_body.get("id") or ""

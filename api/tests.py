@@ -842,6 +842,53 @@ class AdminAuthTests(TestCase):
             f"https://workenginecorp.com.ar/checkout/success?order_id={order.id}",
         )
 
+    @override_settings(
+        MP_ACCESS_TOKEN="APP_USR-test-token",
+        MP_WEBHOOK_SECRET="",
+        FRONTEND_URL="https://workenginecorp.com.ar",
+        BACKEND_PUBLIC_URL="https://backend.test",
+        DEBUG=False,
+        SECURE_SSL_REDIRECT=False,
+    )
+    @patch("mercadopago.SDK")
+    def test_mercado_pago_unauthorized_returns_clear_error(self, mocked_sdk):
+        preference = Mock()
+        preference.create.return_value = {
+            "status": 403,
+            "response": {"message": "At least one policy returned UNAUTHORIZED."},
+        }
+        mocked_sdk.return_value.preference.return_value = preference
+
+        product = Product.objects.create(
+            title="Cuadernillo MP bloqueado",
+            description="Material descargable.",
+            price="1500.00",
+            category_id="estimulacion",
+            image="/images/products/default.jpg",
+            age="6-8 anos",
+            level="Inicial",
+            features=[],
+            objectives=[],
+        )
+        self.create_verified_user("cliente-mp-error@test.com", name="Cliente MP")
+        self.assertEqual(self.login_user("cliente-mp-error@test.com").status_code, 200)
+
+        response = self.client.post(
+            "/api/payments/create-preference",
+            {
+                "items": [{"productId": str(product.id), "quantity": 1}],
+                "customer": {"name": "Cliente MP", "email": "cliente-mp-error@test.com"},
+            },
+            format="json",
+            secure=True,
+        )
+
+        self.assertEqual(response.status_code, 401)
+        self.assertIn("MP_ACCESS_TOKEN", response.data["error"])
+        self.assertEqual(response.data["mpStatus"], 403)
+        order = Order.objects.get(customer_email="cliente-mp-error@test.com")
+        self.assertEqual(order.status, "fallida")
+
     @override_settings(MP_ACCESS_TOKEN="APP_USR-test-token", MP_WEBHOOK_SECRET="")
     @patch("mercadopago.SDK")
     def test_mercado_pago_webhook_fetches_payment_and_grants_access(self, mocked_sdk):
