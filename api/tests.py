@@ -843,8 +843,76 @@ class AdminAuthTests(TestCase):
             payload["back_urls"]["success"],
             "https://workenginecorp.com.ar/checkout/success",
         )
-        self.assertEqual(payload["back_urls"]["failure"], "https://workenginecorp.com.ar/checkout/failure")
-        self.assertEqual(payload["back_urls"]["pending"], "https://workenginecorp.com.ar/checkout/failure")
+        self.assertEqual(
+            payload["back_urls"]["failure"],
+            "https://workenginecorp.com.ar/checkout/failure",
+        )
+        self.assertEqual(
+            payload["back_urls"]["pending"],
+            "https://workenginecorp.com.ar/checkout/failure",
+        )
+
+    @override_settings(
+        MP_ACCESS_TOKEN="APP_USR-test-token",
+        MP_WEBHOOK_SECRET="",
+        FRONTEND_URL="https://workenginecorp.com.ar",
+        BACKEND_PUBLIC_URL="https://backend.test",
+        DEBUG=False,
+        SECURE_SSL_REDIRECT=False,
+    )
+    @patch("mercadopago.SDK")
+    def test_mercado_pago_retries_without_back_urls_when_rejected(self, mocked_sdk):
+        preference = Mock()
+        preference.create.side_effect = [
+            {
+                "status": 400,
+                "response": {
+                    "message": "back_urls invalid. Wrong format",
+                    "cause": [{"code": "invalid_back_urls", "description": "Wrong format"}],
+                },
+            },
+            {
+                "status": 201,
+                "response": {
+                    "id": "pref_retry_123",
+                    "init_point": "https://www.mercadopago.com.ar/checkout/v1/redirect?pref_id=pref_retry_123",
+                },
+            },
+        ]
+        mocked_sdk.return_value.preference.return_value = preference
+
+        product = Product.objects.create(
+            title="Cuadernillo MP retry",
+            description="Material descargable.",
+            price="6000.00",
+            category_id="estimulacion",
+            image="/images/products/default.jpg",
+            age="10-12 anos",
+            level="Intermedio",
+            features=[],
+            objectives=[],
+        )
+        self.create_verified_user("cliente-mp-retry@test.com", name="Cliente MP Retry")
+        self.assertEqual(self.login_user("cliente-mp-retry@test.com").status_code, 200)
+
+        response = self.client.post(
+            "/api/payments/create-preference",
+            {
+                "items": [{"productId": str(product.id), "quantity": 1}],
+                "customer": {"name": "Cliente MP Retry", "email": "cliente-mp-retry@test.com"},
+            },
+            format="json",
+            secure=True,
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["preferenceId"], "pref_retry_123")
+        self.assertTrue(response.data["returnUrlsFallback"])
+        first_payload = preference.create.call_args_list[0].args[0]
+        retry_payload = preference.create.call_args_list[1].args[0]
+        self.assertIn("back_urls", first_payload)
+        self.assertNotIn("back_urls", retry_payload)
+        self.assertNotIn("auto_return", retry_payload)
 
     @override_settings(
         MP_ACCESS_TOKEN="APP_USR-test-token",

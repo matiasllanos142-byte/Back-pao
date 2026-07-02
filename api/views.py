@@ -1,8 +1,10 @@
 import os
+import json
 import hashlib
 import time
 import base64
 import secrets
+import logging
 from datetime import timedelta
 from decimal import Decimal
 from rest_framework import status, generics
@@ -22,6 +24,8 @@ from django.shortcuts import get_object_or_404
 from django.conf import settings
 from django.utils import timezone
 import requests
+
+logger = logging.getLogger(__name__)
 
 from .models import (
     Category,
@@ -875,14 +879,44 @@ def get_mercado_pago_sdk():
 def mercado_pago_error_message(response_body, fallback="Mercado Pago rechazo la operacion."):
     if isinstance(response_body, dict):
         raw_message = response_body.get("message") or response_body.get("error") or fallback
+        cause_details = mercado_pago_cause_details(response_body)
         if "UNAUTHORIZED" in str(raw_message).upper():
             return (
                 "Mercado Pago rechazo la credencial configurada. "
                 "Revisa que MP_ACCESS_TOKEN sea el Access Token de produccion "
                 "de la cuenta vendedora y que la aplicacion este habilitada."
             )
+        if cause_details:
+            return f"{raw_message} ({'; '.join(cause_details[:3])})"
         return raw_message
     return fallback
+
+
+def mercado_pago_cause_details(response_body):
+    causes = response_body.get("cause") if isinstance(response_body, dict) else None
+    if not isinstance(causes, list):
+        return []
+
+    details = []
+    for cause in causes:
+        if isinstance(cause, dict):
+            code = cause.get("code") or cause.get("error_code") or ""
+            description = cause.get("description") or cause.get("message") or ""
+            detail = " - ".join(str(part) for part in [code, description] if part)
+            if detail:
+                details.append(detail)
+        elif cause:
+            details.append(str(cause))
+    return details
+
+
+def is_mercado_pago_back_urls_error(response_body):
+    if isinstance(response_body, (dict, list)):
+        raw = json.dumps(response_body, ensure_ascii=False)
+    else:
+        raw = str(response_body or "")
+    normalized = raw.lower()
+    return "back_urls" in normalized or "back url" in normalized or "back_url" in normalized
 
 
 def mercado_pago_response_status(status_code, response_body):
@@ -1392,17 +1426,47 @@ def create_payment_preference_view(request):
             "user_id": str(request.user.id),
         },
     }
-    result = get_mercado_pago_sdk().preference().create(preference_payload)
+    preference_client = get_mercado_pago_sdk().preference()
+    result = preference_client.create(preference_payload)
 
     response_body = result.get("response", {})
     status_code = int(result.get("status") or 500)
+    used_return_urls_fallback = False
+    if status_code >= 400 and is_mercado_pago_back_urls_error(response_body):
+        logger.warning(
+            "Mercado Pago rejected back_urls. Retrying without return URLs. "
+            "status=%s response=%s back_urls=%s notification_url=%s",
+            status_code,
+            response_body,
+            preference_payload.get("back_urls"),
+            notification_url,
+        )
+        fallback_payload = {
+            key: value
+            for key, value in preference_payload.items()
+            if key not in {"back_urls", "auto_return"}
+        }
+        result = preference_client.create(fallback_payload)
+        response_body = result.get("response", {})
+        status_code = int(result.get("status") or 500)
+        used_return_urls_fallback = status_code < 400
+
     if status_code >= 400:
+        logger.warning(
+            "Mercado Pago preference creation failed. status=%s response=%s "
+            "back_urls=%s notification_url=%s",
+            status_code,
+            response_body,
+            preference_payload.get("back_urls"),
+            notification_url,
+        )
         order.status = "fallida"
         order.save(update_fields=["status", "updated_at"])
         return Response(
             {
                 "error": mercado_pago_error_message(response_body),
                 "mpStatus": status_code,
+                "mpCause": response_body.get("cause") if isinstance(response_body, dict) else [],
             },
             status=mercado_pago_response_status(status_code, response_body),
         )
@@ -1422,6 +1486,7 @@ def create_payment_preference_view(request):
         "orderId": str(order.id),
         "preferenceId": order.preference_id,
         "notificationUrl": notification_url,
+        "returnUrlsFallback": used_return_urls_fallback,
     })
 
 
