@@ -195,6 +195,8 @@ DEFAULT_CORS_ALLOWED_ORIGINS = [
     "http://localhost:3000",
     "http://127.0.0.1:3000",
     "https://paola-psicope.vercel.app",
+    "https://workenginecorp.com.ar",
+    "https://www.workenginecorp.com.ar",
 ]
 CONFIGURED_CORS_ALLOWED_ORIGINS = [
     url_with_default_scheme(origin)

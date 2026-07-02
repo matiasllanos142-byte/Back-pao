@@ -15,6 +15,7 @@ from django.contrib.auth import get_user_model
 from django.contrib.auth.hashers import check_password, make_password
 from django.core import signing
 from django.db import transaction
+from django.db.models import Count, Sum, Q
 from django.http import HttpResponse
 from django.shortcuts import redirect
 from django.shortcuts import get_object_or_404
@@ -639,6 +640,104 @@ def grant_order_access(order):
         )
 
 
+def get_backend_public_url(request):
+    return (settings.BACKEND_PUBLIC_URL or request.build_absolute_uri("/")).rstrip("/")
+
+
+def get_payment_notification_url(request):
+    return f"{get_backend_public_url(request)}/api/payments/webhook?source_news=webhooks"
+
+
+def get_mercado_pago_sdk():
+    import mercadopago
+
+    return mercadopago.SDK(settings.MP_ACCESS_TOKEN)
+
+
+def mercado_pago_error_message(response_body, fallback="Mercado Pago rechazo la operacion."):
+    if isinstance(response_body, dict):
+        return response_body.get("message") or response_body.get("error") or fallback
+    return fallback
+
+
+def validate_mercado_pago_webhook_signature(request, payment_id):
+    if not settings.MP_WEBHOOK_SECRET:
+        return True
+
+    from mercadopago.webhook import InvalidWebhookSignatureError, WebhookSignatureValidator
+
+    data_id = (
+        request.query_params.get("data.id")
+        or request.query_params.get("id")
+        or str(payment_id)
+    )
+
+    try:
+        WebhookSignatureValidator.validate(
+            request.headers.get("x-signature"),
+            request.headers.get("x-request-id"),
+            data_id,
+            settings.MP_WEBHOOK_SECRET,
+        )
+        return True
+    except InvalidWebhookSignatureError:
+        return False
+
+
+def get_mercado_pago_payment(payment_id):
+    result = get_mercado_pago_sdk().payment().get(str(payment_id))
+    response_body = result.get("response", {})
+    status_code = int(result.get("status") or 500)
+    if status_code >= 400:
+        return None, mercado_pago_error_message(
+            response_body,
+            "No se pudo consultar el pago en Mercado Pago.",
+        )
+    return response_body, ""
+
+
+def extract_mercado_pago_payment_id(request):
+    body = request.data if isinstance(request.data, dict) else {}
+    body_data = body.get("data") if isinstance(body.get("data"), dict) else {}
+    return (
+        body_data.get("id")
+        or request.query_params.get("data.id")
+        or request.query_params.get("id")
+    )
+
+
+def update_order_from_mercado_pago_payment(payment):
+    external_reference = str(payment.get("external_reference") or "").strip()
+    if not external_reference:
+        metadata = payment.get("metadata") or {}
+        external_reference = str(metadata.get("order_id") or "").strip()
+    if not external_reference:
+        return None
+
+    try:
+        order = Order.objects.get(id=external_reference)
+    except (Order.DoesNotExist, ValueError):
+        return None
+
+    payment_status = str(payment.get("status") or "").lower()
+    if payment_status == "approved":
+        order.status = "completada"
+    elif payment_status in {"rejected", "cancelled"}:
+        order.status = "fallida"
+    elif payment_status in {"refunded", "charged_back"}:
+        order.status = "reembolsada"
+    else:
+        order.status = "pendiente"
+
+    order.payment_id = str(payment.get("id") or "")
+    order.save(update_fields=["status", "payment_id", "updated_at"])
+
+    if order.status == "completada":
+        grant_order_access(order)
+
+    return order
+
+
 @api_view(["POST"])
 @permission_classes([IsEnvAdmin])
 @parser_classes([MultiPartParser, FormParser])
@@ -697,6 +796,9 @@ def admin_image_upload_view(request):
         {
             "url": secure_url,
             "publicId": data.get("public_id"),
+            "resourceType": data.get("resource_type"),
+            "bytes": data.get("bytes"),
+            "format": data.get("format"),
         }
     )
 
@@ -708,18 +810,6 @@ def admin_download_upload_view(request):
     file = request.FILES.get("file")
     if not file:
         return Response({"error": "Falta el archivo."}, status=status.HTTP_400_BAD_REQUEST)
-
-    allowed_types = {
-        "application/pdf",
-        "application/zip",
-        "application/x-zip-compressed",
-        "application/octet-stream",
-    }
-    if file.content_type not in allowed_types:
-        return Response(
-            {"error": "El archivo debe ser PDF o ZIP."},
-            status=status.HTTP_400_BAD_REQUEST,
-        )
 
     if file.size > settings.CLOUDINARY_MAX_DOWNLOAD_BYTES:
         return Response({"error": "El archivo supera el tamano maximo permitido."}, status=status.HTTP_400_BAD_REQUEST)
@@ -769,6 +859,10 @@ def admin_download_upload_view(request):
             "url": secure_url,
             "fileName": file.name,
             "publicId": data.get("public_id"),
+            "contentType": file.content_type,
+            "bytes": data.get("bytes", file.size),
+            "resourceType": data.get("resource_type"),
+            "format": data.get("format"),
         }
     )
 
@@ -810,12 +904,18 @@ class ProductDetailUpdateDestroyView(generics.RetrieveUpdateDestroyAPIView):
 class AdminProductListCreateView(ProductListCreateView):
     permission_classes = [IsEnvAdmin]
 
+    def get_serializer_class(self):
+        return ProductSerializer
+
     def get_permissions(self):
         return [IsEnvAdmin()]
 
 
 class AdminProductDetailUpdateDestroyView(ProductDetailUpdateDestroyView):
     permission_classes = [IsEnvAdmin]
+
+    def get_serializer_class(self):
+        return ProductSerializer
 
     def get_permissions(self):
         return [IsEnvAdmin()]
@@ -827,6 +927,68 @@ def admin_order_list_view(request):
     orders = Order.objects.all().order_by("-created_at")[:100]
     serializer = OrderSerializer(orders, many=True)
     return Response({"orders": serializer.data})
+
+
+@api_view(["GET"])
+@permission_classes([IsEnvAdmin])
+def admin_dashboard_stats_view(request):
+    products = Product.objects.filter(is_active=True)
+    orders = Order.objects.all()
+    completed_orders = orders.filter(status="completada")
+    revenue = completed_orders.aggregate(total=Sum("total"))["total"] or Decimal("0")
+    sold_units = OrderItem.objects.filter(order__status="completada").aggregate(
+        total=Sum("quantity")
+    )["total"] or 0
+
+    categories = (
+        Category.objects.annotate(product_count=Count("products", filter=Q(products__is_active=True)))
+        .filter(product_count__gt=0)
+        .order_by("-product_count", "name")
+    )
+    status_counts = orders.values("status").annotate(count=Count("id")).order_by("status")
+    top_products = (
+        OrderItem.objects.filter(order__status="completada")
+        .values("product_id", "product__title")
+        .annotate(quantity=Sum("quantity"), revenue=Sum("price"))
+        .order_by("-quantity")[:5]
+    )
+
+    return Response(
+        {
+            "summary": {
+                "products": products.count(),
+                "featuredProducts": products.filter(featured=True).count(),
+                "categories": categories.count(),
+                "orders": orders.count(),
+                "completedOrders": completed_orders.count(),
+                "soldUnits": sold_units,
+                "revenue": str(revenue),
+                "productsWithImages": products.exclude(image="").count(),
+                "productsWithDownloads": products.exclude(download_url="").count(),
+            },
+            "categories": [
+                {
+                    "slug": category.slug,
+                    "name": category.name,
+                    "count": category.product_count,
+                }
+                for category in categories[:8]
+            ],
+            "orderStatuses": [
+                {"status": row["status"], "count": row["count"]}
+                for row in status_counts
+            ],
+            "topProducts": [
+                {
+                    "id": row["product_id"],
+                    "title": row["product__title"],
+                    "quantity": row["quantity"],
+                    "revenue": str(row["revenue"] or "0"),
+                }
+                for row in top_products
+            ],
+        }
+    )
 
 
 @api_view(["GET"])
@@ -944,6 +1106,19 @@ def create_payment_preference_view(request):
         )
 
     base_url = settings.FRONTEND_URL
+    backend_url = get_backend_public_url(request)
+
+    if settings.MP_ACCESS_TOKEN and not settings.DEBUG:
+        if not base_url.startswith("https://"):
+            return Response(
+                {"error": "FRONTEND_URL debe ser HTTPS para Mercado Pago en produccion."},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+        if not backend_url.startswith("https://"):
+            return Response(
+                {"error": "BACKEND_PUBLIC_URL debe ser HTTPS para recibir webhooks de Mercado Pago."},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
 
     if not settings.MP_ACCESS_TOKEN:
         grant_order_access(order)
@@ -953,10 +1128,8 @@ def create_payment_preference_view(request):
             "init_point": f"{base_url}/checkout/success?order_id={order.id}",
         })
 
-    import mercadopago
-
-    sdk = mercadopago.SDK(settings.MP_ACCESS_TOKEN)
-    result = sdk.preference().create({
+    notification_url = get_payment_notification_url(request)
+    preference_payload = {
         "body": {
             "items": [
                 {
@@ -970,16 +1143,37 @@ def create_payment_preference_view(request):
             ],
             "payer": {"name": customer_name, "email": customer_email},
             "back_urls": {
-                "success": f"{base_url}/checkout/success",
-                "failure": f"{base_url}/checkout/failure",
-                "pending": f"{base_url}/checkout/failure",
+                "success": f"{base_url}/checkout/success?order_id={order.id}",
+                "failure": f"{base_url}/checkout/failure?order_id={order.id}",
+                "pending": f"{base_url}/checkout/failure?order_id={order.id}",
             },
             "auto_return": "approved",
             "external_reference": str(order.id),
+            "notification_url": notification_url,
+            "metadata": {
+                "order_id": str(order.id),
+                "user_id": str(request.user.id),
+            },
         }
-    })
+    }
+    result = get_mercado_pago_sdk().preference().create(preference_payload)
 
     response_body = result.get("response", {})
+    status_code = int(result.get("status") or 500)
+    if status_code >= 400:
+        order.status = "fallida"
+        order.save(update_fields=["status", "updated_at"])
+        return Response(
+            {
+                "error": mercado_pago_error_message(response_body),
+                "mpStatus": status_code,
+            },
+            status=status.HTTP_502_BAD_GATEWAY,
+        )
+
+    order.preference_id = response_body.get("id") or ""
+    order.save(update_fields=["preference_id", "updated_at"])
+
     init_point = response_body.get("init_point")
     if not init_point:
         return Response(
@@ -987,27 +1181,35 @@ def create_payment_preference_view(request):
             status=status.HTTP_502_BAD_GATEWAY,
         )
 
-    return Response({"init_point": init_point, "orderId": str(order.id)})
+    return Response({
+        "init_point": init_point,
+        "orderId": str(order.id),
+        "preferenceId": order.preference_id,
+        "notificationUrl": notification_url,
+    })
 
 
 @api_view(["POST"])
 @permission_classes([AllowAny])
 def payment_webhook_view(request):
-    body = request.data
+    payment_id = extract_mercado_pago_payment_id(request)
+    if not payment_id:
+        return Response({"ok": True, "ignored": "missing_payment_id"})
 
-    if body.get("type") == "payment" and body.get("data", {}).get("id"):
-        payment_data = body["data"]
-        order_id = payment_data.get("external_reference")
-        payment_status = payment_data.get("status")
+    if not validate_mercado_pago_webhook_signature(request, payment_id):
+        return Response({"error": "Firma de Mercado Pago invalida."}, status=status.HTTP_401_UNAUTHORIZED)
 
-        if order_id and payment_status == "approved":
-            try:
-                order = Order.objects.get(id=order_id)
-                order.status = "completada"
-                order.payment_id = str(payment_data.get("id"))
-                order.save(update_fields=["status", "payment_id", "updated_at"])
-                grant_order_access(order)
-            except Order.DoesNotExist:
-                pass
+    if not settings.MP_ACCESS_TOKEN:
+        return Response({"ok": True, "ignored": "missing_mp_access_token"})
 
-    return Response({"ok": True})
+    payment, error = get_mercado_pago_payment(payment_id)
+    if error:
+        return Response({"ok": True, "warning": error})
+
+    order = update_order_from_mercado_pago_payment(payment)
+    return Response({
+        "ok": True,
+        "paymentId": str(payment.get("id") or payment_id),
+        "orderId": str(order.id) if order else "",
+        "orderStatus": order.status if order else "",
+    })

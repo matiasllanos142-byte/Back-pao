@@ -1,3 +1,6 @@
+from decimal import Decimal, InvalidOperation
+
+from django.utils.text import slugify
 from rest_framework import serializers
 from django.contrib.auth import get_user_model
 from django.contrib.auth.hashers import make_password
@@ -54,10 +57,103 @@ class CategorySerializer(serializers.ModelSerializer):
         fields = ["slug", "name", "description", "icon", "color"]
 
 
-class ProductSerializer(serializers.ModelSerializer):
-    category = serializers.SlugRelatedField(
-        queryset=Category.objects.all(), slug_field="slug"
+DEFAULT_CATEGORY_META = {
+    "estimulacion": ("Estimulacion Cognitiva", "Brain", "#7C3AED"),
+    "lectoescritura": ("Lectoescritura", "BookOpen", "#F97316"),
+    "dislexia": ("Dislexia", "BookMarked", "#22C55E"),
+    "discalculia": ("Discalculia", "Calculator", "#0EA5E9"),
+    "matematica": ("Matematica", "Calculator", "#06B6D4"),
+    "atencion-memoria": ("Atencion y Memoria", "Eye", "#EC4899"),
+    "funciones-ejecutivas": ("Funciones Ejecutivas", "Puzzle", "#FBBF24"),
+    "tdah": ("TDAH", "Zap", "#F59E0B"),
+    "tea-autismo": ("TEA / Autismo", "Sparkles", "#14B8A6"),
+    "lenguaje": ("Lenguaje", "MessageCircle", "#8B5CF6"),
+    "emociones": ("Emociones", "Heart", "#EF4444"),
+    "habilidades-sociales": ("Habilidades Sociales", "Users", "#10B981"),
+    "habitos-estudio": ("Habitos de Estudio", "NotebookTabs", "#6366F1"),
+    "percepcion-visual": ("Percepcion Visual", "Eye", "#EC4899"),
+    "motricidad-fina": ("Motricidad Fina", "Pencil", "#84CC16"),
+}
+
+
+def normalize_money(value):
+    if value in ("", None):
+        return None
+    if isinstance(value, Decimal):
+        return value
+    if isinstance(value, (int, float)):
+        return Decimal(str(value))
+
+    cleaned = (
+        str(value)
+        .strip()
+        .replace("$", "")
+        .replace("ARS", "")
+        .replace(" ", "")
     )
+    if not cleaned:
+        return None
+
+    if "," in cleaned and "." in cleaned:
+        if cleaned.rfind(",") > cleaned.rfind("."):
+            cleaned = cleaned.replace(".", "").replace(",", ".")
+        else:
+            cleaned = cleaned.replace(",", "")
+    elif "," in cleaned:
+        cleaned = cleaned.replace(".", "").replace(",", ".")
+    elif "." in cleaned:
+        pieces = cleaned.split(".")
+        if len(pieces) > 1 and all(len(piece) == 3 for piece in pieces[1:]):
+            cleaned = "".join(pieces)
+
+    try:
+        return Decimal(cleaned)
+    except InvalidOperation as exc:
+        raise serializers.ValidationError("El precio no tiene un formato valido.") from exc
+
+
+def category_name_from_value(value, slug):
+    text = str(value or "").strip()
+    if text and text != slug:
+        return text
+    if slug in DEFAULT_CATEGORY_META:
+        return DEFAULT_CATEGORY_META[slug][0]
+    return slug.replace("-", " ").title()
+
+
+class CategorySlugField(serializers.Field):
+    def to_representation(self, value):
+        return value.slug if value else ""
+
+    def to_internal_value(self, value):
+        if not value or not str(value).strip():
+            raise serializers.ValidationError("La categoria es obligatoria.")
+
+        original = str(value).strip()
+        slug = slugify(original)[:100] or "sin-categoria"
+        default_name, default_icon, default_color = DEFAULT_CATEGORY_META.get(
+            slug,
+            (category_name_from_value(original, slug), "Package", "#7C3AED"),
+        )
+        category, created = Category.objects.get_or_create(
+            slug=slug,
+            defaults={
+                "name": default_name,
+                "description": f"Recursos de {default_name}.",
+                "icon": default_icon,
+                "color": default_color,
+            },
+        )
+        if not created and original != slug and category.name != original:
+            category.name = original
+            category.save(update_fields=["name"])
+        return category
+
+
+class ProductSerializer(serializers.ModelSerializer):
+    category = CategorySlugField()
+    price = serializers.CharField()
+    compare_at_price = serializers.CharField(required=False, allow_blank=True, allow_null=True)
 
     class Meta:
         model = Product
@@ -66,20 +162,52 @@ class ProductSerializer(serializers.ModelSerializer):
             "title",
             "description",
             "price",
+            "compare_at_price",
             "category",
             "image",
+            "image_public_id",
             "download_url",
             "download_filename",
+            "download_public_id",
+            "download_content_type",
+            "download_size",
             "badge",
             "featured",
             "age",
             "level",
             "features",
             "objectives",
+            "metadata",
             "is_active",
             "created_at",
         ]
         read_only_fields = ["id", "created_at"]
+
+    def validate_price(self, value):
+        money = normalize_money(value)
+        if money is None:
+            raise serializers.ValidationError("El precio es obligatorio.")
+        if money < 0:
+            raise serializers.ValidationError("El precio no puede ser negativo.")
+        return money
+
+    def validate_compare_at_price(self, value):
+        money = normalize_money(value)
+        if money is not None and money < 0:
+            raise serializers.ValidationError("El precio anterior no puede ser negativo.")
+        return money
+
+    def validate(self, attrs):
+        price = attrs.get("price", getattr(self.instance, "price", None))
+        compare_at_price = attrs.get(
+            "compare_at_price",
+            getattr(self.instance, "compare_at_price", None),
+        )
+        if compare_at_price is not None and price is not None and compare_at_price <= price:
+            raise serializers.ValidationError(
+                {"compare_at_price": "El precio anterior debe ser mayor al precio actual."}
+            )
+        return attrs
 
 
 class ProductListSerializer(serializers.ModelSerializer):
@@ -92,6 +220,7 @@ class ProductListSerializer(serializers.ModelSerializer):
             "title",
             "description",
             "price",
+            "compare_at_price",
             "category",
             "image",
             "badge",
@@ -144,10 +273,14 @@ class OrderSerializer(serializers.ModelSerializer):
             "id",
             "total",
             "status",
+            "preference_id",
+            "payment_id",
+            "external_reference",
             "customer",
             "items",
             "created_at",
         ]
+        read_only_fields = ["preference_id", "payment_id", "external_reference", "created_at"]
 
     def get_customer(self, obj):
         return {"name": obj.customer_name, "email": obj.customer_email}

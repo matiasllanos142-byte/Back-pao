@@ -1,1 +1,1 @@
-web: python manage.py migrate && gunicorn paolapsicope_backend.wsgi:application --bind 0.0.0.0:$PORT --workers 2
+web: python manage.py collectstatic --noinput && python manage.py migrate && gunicorn paolapsicope_backend.wsgi:application --bind 0.0.0.0:$PORT --workers 2

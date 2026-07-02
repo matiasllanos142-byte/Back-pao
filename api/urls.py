@@ -12,6 +12,7 @@ urlpatterns = [
     path("admin/products", views.AdminProductListCreateView.as_view(), name="admin-products"),
     path("admin/products/<uuid:pk>", views.AdminProductDetailUpdateDestroyView.as_view(), name="admin-product-detail"),
     path("admin/orders", views.admin_order_list_view, name="admin-orders"),
+    path("admin/dashboard/stats", views.admin_dashboard_stats_view, name="admin-dashboard-stats"),
     path("auth/register", views.register_view, name="register"),
     path("auth/register/verify-code", views.verify_registration_code_view, name="register-verify-code"),
     path("auth/register/resend-code", views.resend_registration_code_view, name="register-resend-code"),

@@ -12,6 +12,8 @@ from .models import (
     PendingRegistration,
     Product,
     PurchasedProduct,
+    Order,
+    OrderItem,
     User,
 )
 from .email_service import make_email_verification_token
@@ -323,6 +325,49 @@ class AdminAuthTests(TestCase):
 
         self.assertEqual(response.status_code, 201)
         self.assertEqual(response.data["title"], "Cuadernillo inicial")
+
+    def test_admin_create_product_accepts_new_category_and_argentine_prices(self):
+        Category.objects.all().delete()
+        login_response = self.client.post(
+            "/api/admin/login",
+            {"username": "paola-admin", "password": "secreto-admin"},
+            format="json",
+        )
+        self.assertEqual(login_response.status_code, 200)
+
+        response = self.client.post(
+            "/api/admin/products",
+            {
+                "title": "Discalculia princesas",
+                "description": "Cuadernillo imprimible.",
+                "price": "48.600,00",
+                "compare_at_price": "81.000,00",
+                "category": "Discalculia",
+                "image": "/images/products/default.jpg",
+                "image_public_id": "paola/products/demo",
+                "download_url": "https://res.cloudinary.com/demo/raw/upload/demo.zip",
+                "download_filename": "demo.zip",
+                "download_public_id": "paola/downloads/demo",
+                "download_content_type": "application/zip",
+                "download_size": 2048,
+                "featured": True,
+                "age": "10-12 anos",
+                "level": "Inicial",
+                "features": ["PDF imprimible"],
+                "objectives": ["Acompanamiento"],
+                "metadata": {"adminControlIds": {"featured": "product-featured"}},
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.data["category"], "discalculia")
+        self.assertEqual(response.data["price"], "48600.00")
+        self.assertEqual(response.data["compare_at_price"], "81000.00")
+        self.assertTrue(Category.objects.filter(slug="discalculia").exists())
+        product = Product.objects.get(id=response.data["id"])
+        self.assertEqual(product.download_public_id, "paola/downloads/demo")
+        self.assertEqual(product.metadata["adminControlIds"]["featured"], "product-featured")
 
     @patch("api.views.requests.post")
     def test_admin_cookie_can_upload_image_to_cloudinary(self, mocked_post):
@@ -737,6 +782,119 @@ class AdminAuthTests(TestCase):
         download_response = self.client.get(f"/api/library/products/{product.id}/download")
         self.assertEqual(download_response.status_code, 200)
         self.assertEqual(download_response.data["downloadUrl"], product.download_url)
+
+    @override_settings(
+        MP_ACCESS_TOKEN="APP_USR-test-token",
+        MP_WEBHOOK_SECRET="",
+        FRONTEND_URL="https://workenginecorp.com.ar",
+        BACKEND_PUBLIC_URL="https://backend.test",
+        DEBUG=False,
+        SECURE_SSL_REDIRECT=False,
+    )
+    @patch("mercadopago.SDK")
+    def test_mercado_pago_preference_uses_production_urls(self, mocked_sdk):
+        preference = Mock()
+        preference.create.return_value = {
+            "status": 201,
+            "response": {
+                "id": "pref_123",
+                "init_point": "https://www.mercadopago.com.ar/checkout/v1/redirect?pref_id=pref_123",
+            },
+        }
+        mocked_sdk.return_value.preference.return_value = preference
+
+        product = Product.objects.create(
+            title="Cuadernillo MP",
+            description="Material descargable.",
+            price="1500.00",
+            category_id="estimulacion",
+            image="/images/products/default.jpg",
+            age="6-8 anos",
+            level="Inicial",
+            features=[],
+            objectives=[],
+        )
+        self.create_verified_user("cliente-mp@test.com", name="Cliente MP")
+        self.assertEqual(self.login_user("cliente-mp@test.com").status_code, 200)
+
+        response = self.client.post(
+            "/api/payments/create-preference",
+            {
+                "items": [{"productId": str(product.id), "quantity": 1}],
+                "customer": {"name": "Cliente MP", "email": "cliente-mp@test.com"},
+            },
+            format="json",
+            secure=True,
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["preferenceId"], "pref_123")
+        order = Order.objects.get(id=response.data["orderId"])
+        self.assertEqual(order.preference_id, "pref_123")
+        payload = preference.create.call_args.args[0]["body"]
+        self.assertEqual(
+            payload["notification_url"],
+            "https://backend.test/api/payments/webhook?source_news=webhooks",
+        )
+        self.assertEqual(payload["external_reference"], str(order.id))
+        self.assertEqual(
+            payload["back_urls"]["success"],
+            f"https://workenginecorp.com.ar/checkout/success?order_id={order.id}",
+        )
+
+    @override_settings(MP_ACCESS_TOKEN="APP_USR-test-token", MP_WEBHOOK_SECRET="")
+    @patch("mercadopago.SDK")
+    def test_mercado_pago_webhook_fetches_payment_and_grants_access(self, mocked_sdk):
+        payment = Mock()
+        mocked_sdk.return_value.payment.return_value = payment
+
+        product = Product.objects.create(
+            title="Cuadernillo webhook",
+            description="Material descargable.",
+            price="1500.00",
+            category_id="estimulacion",
+            image="/images/products/default.jpg",
+            download_url="https://res.cloudinary.com/demo/raw/upload/cuadernillo.pdf",
+            download_filename="cuadernillo.pdf",
+            age="6-8 anos",
+            level="Inicial",
+            features=[],
+            objectives=[],
+        )
+        user = self.create_verified_user("cliente-webhook@test.com", name="Cliente Webhook")
+        order = Order.objects.create(
+            user=user,
+            total="1500.00",
+            status="pendiente",
+            customer_name="Cliente Webhook",
+            customer_email=user.email,
+            external_reference="",
+        )
+        order.external_reference = str(order.id)
+        order.save(update_fields=["external_reference", "updated_at"])
+        OrderItem.objects.create(order=order, product=product, quantity=1, price=product.price)
+        payment.get.return_value = {
+            "status": 200,
+            "response": {
+                "id": "pay_123",
+                "status": "approved",
+                "external_reference": str(order.id),
+            },
+        }
+
+        response = self.client.post(
+            "/api/payments/webhook",
+            {"type": "payment", "data": {"id": "pay_123"}},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        order.refresh_from_db()
+        self.assertEqual(order.status, "completada")
+        self.assertEqual(order.payment_id, "pay_123")
+        self.assertTrue(
+            PurchasedProduct.objects.filter(user=user, product=product, is_active=True).exists()
+        )
 
     def test_public_product_detail_does_not_expose_download_url(self):
         product = Product.objects.create(
