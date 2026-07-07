@@ -30,6 +30,25 @@ def url_with_default_scheme(value):
 
     return f"https://{cleaned}"
 
+
+def public_frontend_url(value, default="http://localhost:3000"):
+    raw_value = str(value or default or "")
+    candidates = [
+        url_with_default_scheme(part)
+        for part in raw_value.replace("\n", ",").replace(";", ",").split(",")
+        if part.strip()
+    ]
+    candidates = [candidate for candidate in candidates if candidate]
+    if not candidates:
+        return url_with_default_scheme(default)
+
+    custom_domain = [
+        candidate
+        for candidate in candidates
+        if "up.railway.app" not in urlparse(candidate).netloc
+    ]
+    return (custom_domain[0] if custom_domain else candidates[0]).rstrip("/")
+
 SECRET_KEY = os.environ.get("SECRET_KEY", "django-insecure-cambia-en-produccion")
 
 DEBUG = os.environ.get("DEBUG", "False").lower() == "true"
@@ -98,7 +117,8 @@ EMAIL_VERIFICATION_SUCCESS_URL = url_with_default_scheme(os.environ.get("EMAIL_V
 EMAIL_VERIFICATION_ERROR_URL = url_with_default_scheme(os.environ.get("EMAIL_VERIFICATION_ERROR_URL", ""))
 MP_ACCESS_TOKEN = os.environ.get("MP_ACCESS_TOKEN", "")
 MP_WEBHOOK_SECRET = os.environ.get("MP_WEBHOOK_SECRET", "")
-FRONTEND_URL = url_with_default_scheme(os.environ.get("FRONTEND_URL", "http://localhost:3000"))
+MP_MODE = os.environ.get("MP_MODE", "auto").strip().lower()
+FRONTEND_URL = public_frontend_url(os.environ.get("FRONTEND_URL", "http://localhost:3000"))
 
 INSTALLED_APPS = [
     "django.contrib.admin",

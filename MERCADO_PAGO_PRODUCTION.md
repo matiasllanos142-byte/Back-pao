@@ -8,7 +8,12 @@ MP_WEBHOOK_SECRET=...
 FRONTEND_URL=https://workenginecorp.com.ar
 BACKEND_PUBLIC_URL=https://back-paopsicope-production.up.railway.app
 CORS_ALLOWED_ORIGINS=https://workenginecorp.com.ar,https://www.workenginecorp.com.ar
+MP_MODE=production
 ```
+
+`FRONTEND_URL` tiene que ser una sola URL. No pegar dos dominios separados por coma.
+Para cobrar real, `MP_ACCESS_TOKEN` debe ser el Access Token productivo `APP_USR-...`.
+Si se usa un token `TEST-...`, configurar `MP_MODE=test` y probar con usuarios/tarjetas de prueba.
 
 En Mercado Pago, configurar Webhooks para el evento `payment` apuntando a:
 

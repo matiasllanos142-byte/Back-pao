@@ -7,6 +7,7 @@ import secrets
 import logging
 from datetime import timedelta
 from decimal import Decimal
+from urllib.parse import urlparse
 from rest_framework import status, generics
 from rest_framework.decorators import api_view, parser_classes, permission_classes
 from rest_framework.parsers import FormParser, MultiPartParser
@@ -1182,10 +1183,57 @@ def get_payment_notification_url(request):
     return f"{get_backend_public_url(request)}/api/payments/webhook?source_news=webhooks"
 
 
+def normalize_frontend_url(value):
+    raw_value = str(value or "http://localhost:3000")
+    candidates = []
+    for part in raw_value.replace("\n", ",").replace(";", ",").split(","):
+        cleaned = part.strip().strip('"').strip("'").rstrip("/")
+        if not cleaned:
+            continue
+        parsed = urlparse(cleaned)
+        if not (parsed.scheme and parsed.netloc):
+            if cleaned.startswith(("localhost", "127.0.0.1", "[::1]")):
+                cleaned = f"http://{cleaned}"
+            else:
+                cleaned = f"https://{cleaned}"
+        candidates.append(cleaned.rstrip("/"))
+
+    if not candidates:
+        return "http://localhost:3000"
+
+    custom_domain = [
+        candidate
+        for candidate in candidates
+        if "up.railway.app" not in urlparse(candidate).netloc
+    ]
+    return custom_domain[0] if custom_domain else candidates[0]
+
+
 def get_mercado_pago_sdk():
     import mercadopago
 
     return mercadopago.SDK(settings.MP_ACCESS_TOKEN)
+
+
+def get_mercado_pago_mode():
+    configured_mode = str(getattr(settings, "MP_MODE", "auto") or "auto").lower().strip()
+    if configured_mode in {"test", "sandbox"}:
+        return "test"
+    if configured_mode in {"production", "prod"}:
+        return "production"
+
+    token = str(settings.MP_ACCESS_TOKEN or "").strip()
+    return "test" if token.startswith("TEST-") else "production"
+
+
+def get_mercado_pago_checkout_url(response_body, mode):
+    if not isinstance(response_body, dict):
+        return ""
+
+    if mode == "test":
+        return response_body.get("sandbox_init_point") or response_body.get("init_point") or ""
+
+    return response_body.get("init_point") or ""
 
 
 def mercado_pago_error_message(response_body, fallback="Mercado Pago rechazo la operacion."):
@@ -1689,7 +1737,7 @@ def create_payment_preference_view(request):
             price=item["product"].price,
         )
 
-    base_url = settings.FRONTEND_URL
+    base_url = normalize_frontend_url(settings.FRONTEND_URL)
     backend_url = get_backend_public_url(request)
 
     if settings.MP_ACCESS_TOKEN and not settings.DEBUG:
@@ -1711,6 +1759,22 @@ def create_payment_preference_view(request):
             "orderId": str(order.id),
             "init_point": f"{base_url}/checkout/success?order_id={order.id}",
         })
+
+    mercado_pago_mode = get_mercado_pago_mode()
+    if mercado_pago_mode == "production" and str(settings.MP_ACCESS_TOKEN).strip().startswith("TEST-"):
+        order.status = "fallida"
+        order.save(update_fields=["status", "updated_at"])
+        return Response(
+            {
+                "error": (
+                    "Mercado Pago esta configurado como produccion, pero MP_ACCESS_TOKEN es de prueba. "
+                    "Para cobrar real usa el Access Token productivo APP_USR de la cuenta vendedora. "
+                    "Para pruebas, configura MP_MODE=test y usa usuarios/tarjetas de prueba."
+                ),
+                "mpMode": mercado_pago_mode,
+            },
+            status=status.HTTP_409_CONFLICT,
+        )
 
     notification_url = get_payment_notification_url(request)
     preference_payload = {
@@ -1786,10 +1850,13 @@ def create_payment_preference_view(request):
     order.preference_id = response_body.get("id") or ""
     order.save(update_fields=["preference_id", "updated_at"])
 
-    init_point = response_body.get("init_point")
+    init_point = get_mercado_pago_checkout_url(response_body, mercado_pago_mode)
     if not init_point:
         return Response(
-            {"error": "Mercado Pago no devolvio un link de pago."},
+            {
+                "error": "Mercado Pago no devolvio un link de pago valido.",
+                "mpMode": mercado_pago_mode,
+            },
             status=status.HTTP_502_BAD_GATEWAY,
         )
 
@@ -1799,6 +1866,7 @@ def create_payment_preference_view(request):
         "preferenceId": order.preference_id,
         "notificationUrl": notification_url,
         "returnUrlsFallback": used_return_urls_fallback,
+        "mpMode": mercado_pago_mode,
     })
 
 
