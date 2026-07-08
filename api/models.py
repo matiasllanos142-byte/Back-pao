@@ -244,6 +244,7 @@ class Order(models.Model):
     preference_id = models.CharField(max_length=200, blank=True, null=True)
     payment_id = models.CharField(max_length=200, blank=True, null=True)
     external_reference = models.CharField(max_length=200, blank=True, null=True)
+    purchase_email_sent_at = models.DateTimeField(blank=True, null=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 

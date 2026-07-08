@@ -16,7 +16,7 @@ from .models import (
     OrderItem,
     User,
 )
-from .email_service import make_email_verification_token
+from .email_service import EmailDeliveryError, make_email_verification_token
 
 
 @override_settings(
@@ -783,6 +783,83 @@ class AdminAuthTests(TestCase):
         self.assertEqual(download_response.status_code, 200)
         self.assertEqual(download_response.data["downloadUrl"], product.download_url)
 
+    @patch("api.views.send_purchase_confirmation_email")
+    def test_completed_demo_payment_sends_purchase_email_once(self, mocked_email):
+        mocked_email.return_value = {"sent": True, "id": "email_123", "reason": None}
+        product = Product.objects.create(
+            title="Cuadernillo con mail",
+            description="Material descargable.",
+            price="1500.00",
+            category_id="estimulacion",
+            image="/images/products/default.jpg",
+            download_url="https://res.cloudinary.com/demo/raw/upload/cuadernillo.pdf",
+            download_filename="cuadernillo.pdf",
+            age="6-8 anos",
+            level="Inicial",
+            features=[],
+            objectives=[],
+        )
+        self.create_verified_user("cliente-mail@test.com", name="Cliente Mail")
+        self.assertEqual(self.login_user("cliente-mail@test.com").status_code, 200)
+
+        response = self.client.post(
+            "/api/payments/create-preference",
+            {
+                "items": [{"productId": str(product.id), "quantity": 1}],
+                "customer": {"name": "Cliente Mail", "email": "cliente-mail@test.com"},
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        order = Order.objects.get(id=response.data["orderId"])
+        self.assertIsNotNone(order.purchase_email_sent_at)
+        self.assertEqual(mocked_email.call_count, 1)
+
+        from .views import grant_order_access
+
+        grant_order_access(order)
+        self.assertEqual(mocked_email.call_count, 1)
+
+    @patch("api.views.send_purchase_confirmation_email")
+    def test_purchase_email_failure_does_not_block_access(self, mocked_email):
+        mocked_email.side_effect = EmailDeliveryError("Resend caido")
+        product = Product.objects.create(
+            title="Cuadernillo sin mail",
+            description="Material descargable.",
+            price="1500.00",
+            category_id="estimulacion",
+            image="/images/products/default.jpg",
+            download_url="https://res.cloudinary.com/demo/raw/upload/cuadernillo.pdf",
+            download_filename="cuadernillo.pdf",
+            age="6-8 anos",
+            level="Inicial",
+            features=[],
+            objectives=[],
+        )
+        self.create_verified_user("cliente-mail-falla@test.com", name="Cliente Falla")
+        self.assertEqual(self.login_user("cliente-mail-falla@test.com").status_code, 200)
+
+        response = self.client.post(
+            "/api/payments/create-preference",
+            {
+                "items": [{"productId": str(product.id), "quantity": 1}],
+                "customer": {"name": "Cliente Falla", "email": "cliente-mail-falla@test.com"},
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        order = Order.objects.get(id=response.data["orderId"])
+        self.assertIsNone(order.purchase_email_sent_at)
+        self.assertTrue(
+            PurchasedProduct.objects.filter(
+                user__email="cliente-mail-falla@test.com",
+                product=product,
+                is_active=True,
+            ).exists()
+        )
+
     @override_settings(
         MP_ACCESS_TOKEN="APP_USR-test-token",
         MP_WEBHOOK_SECRET="",
@@ -1067,8 +1144,10 @@ class AdminAuthTests(TestCase):
         )
 
     @override_settings(MP_ACCESS_TOKEN="APP_USR-test-token", MP_WEBHOOK_SECRET="")
+    @patch("api.views.send_purchase_confirmation_email")
     @patch("mercadopago.SDK")
-    def test_mercado_pago_webhook_fetches_payment_and_grants_access(self, mocked_sdk):
+    def test_mercado_pago_webhook_fetches_payment_and_grants_access(self, mocked_sdk, mocked_email):
+        mocked_email.return_value = {"sent": True, "id": "email_mp_123", "reason": None}
         payment = Mock()
         mocked_sdk.return_value.payment.return_value = payment
 
@@ -1119,6 +1198,16 @@ class AdminAuthTests(TestCase):
         self.assertTrue(
             PurchasedProduct.objects.filter(user=user, product=product, is_active=True).exists()
         )
+        self.assertIsNotNone(order.purchase_email_sent_at)
+        self.assertEqual(mocked_email.call_count, 1)
+
+        repeated_response = self.client.post(
+            "/api/payments/webhook",
+            {"type": "payment", "data": {"id": "pay_123"}},
+            format="json",
+        )
+        self.assertEqual(repeated_response.status_code, 200)
+        self.assertEqual(mocked_email.call_count, 1)
 
     def test_public_product_detail_does_not_expose_download_url(self):
         product = Product.objects.create(

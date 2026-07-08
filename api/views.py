@@ -7,6 +7,7 @@ import secrets
 import logging
 from datetime import timedelta
 from decimal import Decimal
+from pathlib import Path
 from urllib.parse import urlparse
 from rest_framework import status, generics
 from rest_framework.decorators import api_view, parser_classes, permission_classes
@@ -61,6 +62,7 @@ from .email_service import (
     EmailDeliveryError,
     read_email_verification_token,
     send_password_reset_code_email,
+    send_purchase_confirmation_email,
     send_registration_code_email,
     send_verification_email,
 )
@@ -573,9 +575,22 @@ def sign_cloudinary_upload(params, api_secret):
 def cloudinary_error(response, fallback):
     try:
         data = response.json()
-        message = data.get("error", {}).get("message")
-        return message or fallback
     except ValueError:
+        return fallback
+
+    try:
+        error = data.get("error")
+        if isinstance(error, dict):
+            return error.get("message") or fallback
+        if isinstance(error, str):
+            return error
+
+        message = data.get("message")
+        if isinstance(message, str):
+            return message
+
+        return fallback
+    except Exception:
         return fallback
 
 
@@ -1174,6 +1189,30 @@ def grant_order_access(order):
             },
         )
 
+    send_purchase_confirmation_email_once(order)
+
+
+def send_purchase_confirmation_email_once(order):
+    if order.purchase_email_sent_at:
+        return
+
+    try:
+        result = send_purchase_confirmation_email(order)
+    except EmailDeliveryError as exc:
+        logger.warning("Purchase confirmation email failed for order %s: %s", order.id, exc)
+        return
+
+    if not result.get("sent"):
+        logger.warning(
+            "Purchase confirmation email was not sent for order %s: %s",
+            order.id,
+            result.get("reason") or "unknown_reason",
+        )
+        return
+
+    order.purchase_email_sent_at = timezone.now()
+    order.save(update_fields=["purchase_email_sent_at", "updated_at"])
+
 
 def get_backend_public_url(request):
     return (settings.BACKEND_PUBLIC_URL or request.build_absolute_uri("/")).rstrip("/")
@@ -1410,18 +1449,39 @@ def admin_image_upload_view(request):
             files={"file": (image.name, image.file, image.content_type)},
             timeout=30,
         )
-    except requests.RequestException:
+    except requests.RequestException as exc:
+        logger.error("Cloudinary image upload request failed: %s", exc, exc_info=True)
         return Response({"error": "No se pudo subir la imagen."}, status=status.HTTP_502_BAD_GATEWAY)
 
     if response.status_code >= 400:
+        message = cloudinary_error(response, "Cloudinary rechazo la imagen.")
+        logger.error(
+            "Cloudinary image upload rejected: status=%s message=%s body=%s",
+            response.status_code,
+            message,
+            response.text[:1000],
+        )
         return Response(
-            {"error": cloudinary_error(response, "Cloudinary rechazo la imagen.")},
+            {"error": message},
             status=status.HTTP_502_BAD_GATEWAY,
         )
 
-    data = response.json()
+    try:
+        data = response.json()
+    except ValueError:
+        logger.error(
+            "Cloudinary image upload returned non-JSON response: status=%s body=%s",
+            response.status_code,
+            response.text[:1000],
+        )
+        return Response(
+            {"error": "Cloudinary devolvio una respuesta invalida."},
+            status=status.HTTP_502_BAD_GATEWAY,
+        )
+
     secure_url = data.get("secure_url")
     if not secure_url:
+        logger.error("Cloudinary image upload response without secure_url: %s", data)
         return Response({"error": "Cloudinary no devolvio una URL valida."}, status=status.HTTP_502_BAD_GATEWAY)
 
     return Response(
@@ -1435,6 +1495,16 @@ def admin_image_upload_view(request):
     )
 
 
+VALID_DOWNLOAD_TYPES = {
+    "application/pdf",
+    "application/zip",
+    "application/x-zip-compressed",
+    "application/octet-stream",
+}
+
+VALID_DOWNLOAD_EXTENSIONS = {".pdf", ".zip"}
+
+
 @api_view(["POST"])
 @permission_classes([IsEnvAdmin])
 @parser_classes([MultiPartParser, FormParser])
@@ -1442,6 +1512,17 @@ def admin_download_upload_view(request):
     file = request.FILES.get("file")
     if not file:
         return Response({"error": "Falta el archivo."}, status=status.HTTP_400_BAD_REQUEST)
+
+    extension = Path(file.name).suffix.lower()
+    content_type = (file.content_type or "").lower()
+
+    type_valid = content_type in VALID_DOWNLOAD_TYPES or extension in VALID_DOWNLOAD_EXTENSIONS
+    ext_valid = extension in VALID_DOWNLOAD_EXTENSIONS
+    if not type_valid or not ext_valid:
+        return Response(
+            {"error": "El archivo debe ser PDF o ZIP."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
 
     if file.size > settings.CLOUDINARY_MAX_DOWNLOAD_BYTES:
         return Response({"error": "El archivo supera el tamano maximo permitido."}, status=status.HTTP_400_BAD_REQUEST)
@@ -1472,19 +1553,43 @@ def admin_download_upload_view(request):
             files={"file": (file.name, file.file, file.content_type)},
             timeout=60,
         )
-    except requests.RequestException:
+    except requests.RequestException as exc:
+        logger.error("Cloudinary download upload request failed: %s", exc, exc_info=True)
         return Response({"error": "No se pudo subir el archivo."}, status=status.HTTP_502_BAD_GATEWAY)
 
-    if response.status_code >= 400:
+    if not response.ok:
+        message = cloudinary_error(response, "No se pudo subir el archivo a Cloudinary.")
+        logger.error(
+            "Cloudinary raw upload failed: status=%s message=%s body=%s",
+            response.status_code,
+            message,
+            response.text[:1000],
+        )
         return Response(
-            {"error": cloudinary_error(response, "Cloudinary rechazo el archivo.")},
+            {"error": message},
             status=status.HTTP_502_BAD_GATEWAY,
         )
 
-    data = response.json()
+    try:
+        data = response.json()
+    except ValueError:
+        logger.error(
+            "Cloudinary raw upload returned non-JSON response: status=%s body=%s",
+            response.status_code,
+            response.text[:1000],
+        )
+        return Response(
+            {"error": "Cloudinary devolvio una respuesta invalida al subir el archivo."},
+            status=status.HTTP_502_BAD_GATEWAY,
+        )
+
     secure_url = data.get("secure_url")
     if not secure_url:
-        return Response({"error": "Cloudinary no devolvio una URL valida."}, status=status.HTTP_502_BAD_GATEWAY)
+        logger.error("Cloudinary raw upload response without secure_url: %s", data)
+        return Response(
+            {"error": "Cloudinary no devolvio una URL valida para el archivo."},
+            status=status.HTTP_502_BAD_GATEWAY,
+        )
 
     return Response(
         {
