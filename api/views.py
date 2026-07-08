@@ -1489,11 +1489,146 @@ def admin_image_upload_view(request):
         {
             "url": secure_url,
             "publicId": data.get("public_id"),
-            "resourceType": data.get("resource_type"),
+            "contentType": image.content_type,
             "bytes": data.get("bytes"),
+            "resourceType": data.get("resource_type"),
             "format": data.get("format"),
         }
     )
+
+
+def extract_cloudinary_public_id(url=None, public_id=None):
+    if public_id:
+        pid = public_id.strip()
+    elif url:
+        cloud_name = "res.cloudinary.com"
+        if cloud_name not in url:
+            return None
+        from urllib.parse import unquote, urlparse as up
+        parsed = up(unquote(url))
+        path = parsed.path.lstrip("/")
+        parts = path.split("/")
+        try:
+            upload_idx = parts.index("upload")
+        except ValueError:
+            return None
+        version_and_after = parts[upload_idx + 1:]
+        version_removed = [p for p in version_and_after if not (p.startswith("v") and p[1:].isdigit())]
+        pid = "/".join(version_removed)
+        dot = pid.rfind(".")
+        if dot > pid.rfind("/"):
+            pid = pid[:dot]
+    else:
+        return None
+
+    if not pid:
+        return None
+
+    prefix = settings.CLOUDINARY_UPLOAD_FOLDER
+    if not pid.startswith(prefix):
+        return None
+
+    if any(c in pid for c in ["..", "//", "\\"]):
+        return None
+
+    return pid
+
+
+@api_view(["POST"])
+@permission_classes([IsEnvAdmin])
+def admin_image_delete_view(request):
+    url = request.data.get("url", "").strip()
+    public_id = request.data.get("publicId", "").strip()
+
+    pid = extract_cloudinary_public_id(url=url or None, public_id=public_id or None)
+    if not pid:
+        return Response(
+            {"error": "No se pudo identificar la imagen en Cloudinary."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    credentials = get_cloudinary_credentials()
+    if not credentials:
+        return Response(
+            {"error": "Configura Cloudinary en Ajustes antes de eliminar imagenes."},
+            status=status.HTTP_409_CONFLICT,
+        )
+
+    timestamp = int(time.time())
+    destroy_params = {
+        "public_id": pid,
+        "timestamp": timestamp,
+        "invalidate": "true",
+    }
+    signature = sign_cloudinary_upload(destroy_params, credentials["api_secret"])
+    destroy_url = f"https://api.cloudinary.com/v1_1/{credentials['cloud_name']}/image/destroy"
+
+    logger.info("Cloudinary image delete requested: public_id=%s", pid)
+
+    try:
+        response = requests.post(
+            destroy_url,
+            data={
+                "public_id": pid,
+                "timestamp": timestamp,
+                "invalidate": "true",
+                "api_key": credentials["api_key"],
+                "signature": signature,
+            },
+            timeout=30,
+        )
+    except requests.RequestException as exc:
+        logger.error("Cloudinary image delete request failed: %s", exc, exc_info=True)
+        return Response(
+            {"error": "No se pudo eliminar la imagen de Cloudinary."},
+            status=status.HTTP_502_BAD_GATEWAY,
+        )
+
+    if not response.ok:
+        logger.error(
+            "Cloudinary image delete rejected: status=%s body=%s",
+            response.status_code,
+            response.text[:1000],
+        )
+        return Response(
+            {"error": "No se pudo eliminar la imagen de Cloudinary."},
+            status=status.HTTP_502_BAD_GATEWAY,
+        )
+
+    try:
+        result = response.json()
+    except ValueError:
+        logger.error(
+            "Cloudinary image delete non-JSON response: status=%s body=%s",
+            response.status_code,
+            response.text[:1000],
+        )
+        return Response(
+            {"error": "No se pudo eliminar la imagen de Cloudinary."},
+            status=status.HTTP_502_BAD_GATEWAY,
+        )
+
+    result_status = result.get("result")
+    if result_status == "not found":
+        return Response({
+            "ok": True,
+            "deleted": False,
+            "publicId": pid,
+            "message": "La imagen ya no existia en Cloudinary.",
+        })
+
+    if result_status != "ok":
+        logger.error("Cloudinary image delete unexpected result: %s", result)
+        return Response(
+            {"error": "No se pudo eliminar la imagen de Cloudinary."},
+            status=status.HTTP_502_BAD_GATEWAY,
+        )
+
+    return Response({
+        "ok": True,
+        "deleted": True,
+        "publicId": pid,
+    })
 
 
 VALID_DOWNLOAD_TYPES = {

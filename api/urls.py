@@ -17,6 +17,7 @@ urlpatterns = [
     path("admin/workbooks/<uuid:pk>/build", views.admin_workbook_build_view, name="admin-workbook-build"),
     path("admin/workbooks/<uuid:pk>/pdf", views.admin_workbook_pdf_view, name="admin-workbook-pdf"),
     path("admin/uploads/image", views.admin_image_upload_view, name="admin-image-upload"),
+    path("admin/uploads/image/delete", views.admin_image_delete_view, name="admin-image-delete"),
     path("admin/uploads/download", views.admin_download_upload_view, name="admin-download-upload"),
     path("admin/uploads/download/delete", views.admin_download_delete_view, name="admin-download-delete"),
     path("admin/products", views.AdminProductListCreateView.as_view(), name="admin-products"),
