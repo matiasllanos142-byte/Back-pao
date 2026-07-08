@@ -78,6 +78,14 @@ CLOUDINARY_MAX_DOWNLOAD_BYTES = int(os.environ.get("CLOUDINARY_MAX_DOWNLOAD_BYTE
 DATA_UPLOAD_MAX_MEMORY_SIZE = int(os.environ.get("DATA_UPLOAD_MAX_MEMORY_SIZE", str(30 * 1024 * 1024)))
 FILE_UPLOAD_MAX_MEMORY_SIZE = int(os.environ.get("FILE_UPLOAD_MAX_MEMORY_SIZE", str(30 * 1024 * 1024)))
 
+R2_ACCOUNT_ID = os.environ.get("R2_ACCOUNT_ID", "")
+R2_ACCESS_KEY_ID = os.environ.get("R2_ACCESS_KEY_ID", "")
+R2_SECRET_ACCESS_KEY = os.environ.get("R2_SECRET_ACCESS_KEY", "")
+R2_BUCKET_NAME = os.environ.get("R2_BUCKET_NAME", "")
+R2_PUBLIC_BASE_URL = os.environ.get("R2_PUBLIC_BASE_URL", "")
+R2_DOWNLOAD_PREFIX = os.environ.get("R2_DOWNLOAD_PREFIX", "paola-psicope/products/downloads")
+DOWNLOAD_MAX_BYTES = int(os.environ.get("DOWNLOAD_MAX_BYTES", str(100 * 1024 * 1024)))
+
 NVIDIA_API_KEY = os.environ.get("NVIDIA_API_KEY", "")
 NVIDIA_SETTINGS_SECRET = os.environ.get("NVIDIA_SETTINGS_SECRET", SECRET_KEY)
 NVIDIA_BASE_URL = url_with_default_scheme(

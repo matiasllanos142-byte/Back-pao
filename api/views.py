@@ -8,6 +8,7 @@ import logging
 from datetime import timedelta
 from decimal import Decimal
 from pathlib import Path
+from uuid import uuid4
 from urllib.parse import urlparse
 from rest_framework import status, generics
 from rest_framework.decorators import api_view, parser_classes, permission_classes
@@ -1505,6 +1506,31 @@ VALID_DOWNLOAD_TYPES = {
 VALID_DOWNLOAD_EXTENSIONS = {".pdf", ".zip"}
 
 
+def get_r2_client():
+    if not all([
+        settings.R2_ACCOUNT_ID,
+        settings.R2_ACCESS_KEY_ID,
+        settings.R2_SECRET_ACCESS_KEY,
+        settings.R2_BUCKET_NAME,
+        settings.R2_PUBLIC_BASE_URL,
+    ]):
+        return None
+    import boto3
+    endpoint_url = f"https://{settings.R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+    return boto3.client(
+        "s3",
+        endpoint_url=endpoint_url,
+        aws_access_key_id=settings.R2_ACCESS_KEY_ID,
+        aws_secret_access_key=settings.R2_SECRET_ACCESS_KEY,
+    )
+
+
+def safe_filename(filename):
+    name = Path(filename).name
+    safe = "".join(c for c in name if c.isalnum() or c in "._- ")
+    return safe or "download"
+
+
 @api_view(["POST"])
 @permission_classes([IsEnvAdmin])
 @parser_classes([MultiPartParser, FormParser])
@@ -1524,82 +1550,60 @@ def admin_download_upload_view(request):
             status=status.HTTP_400_BAD_REQUEST,
         )
 
-    if file.size > settings.CLOUDINARY_MAX_DOWNLOAD_BYTES:
-        return Response({"error": "El archivo supera el tamano maximo permitido."}, status=status.HTTP_400_BAD_REQUEST)
-
-    credentials = get_cloudinary_credentials()
-    if not credentials:
+    if file.size > settings.DOWNLOAD_MAX_BYTES:
         return Response(
-            {"error": "Configura Cloudinary en Ajustes antes de subir archivos."},
+            {"error": "El archivo supera el maximo permitido de 100 MB."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    if not all([
+        settings.R2_ACCOUNT_ID,
+        settings.R2_ACCESS_KEY_ID,
+        settings.R2_SECRET_ACCESS_KEY,
+        settings.R2_BUCKET_NAME,
+        settings.R2_PUBLIC_BASE_URL,
+    ]):
+        return Response(
+            {"error": "Falta configurar Cloudflare R2 en el servidor."},
             status=status.HTTP_409_CONFLICT,
         )
 
-    timestamp = int(time.time())
-    upload_params = {
-        "timestamp": timestamp,
-        "folder": settings.CLOUDINARY_DOWNLOAD_FOLDER,
-    }
-    signature = sign_cloudinary_upload(upload_params, credentials["api_secret"])
-    upload_url = f"https://api.cloudinary.com/v1_1/{credentials['cloud_name']}/raw/upload"
+    try:
+        client = get_r2_client()
+    except Exception as exc:
+        logger.error("Failed to initialize R2 client: %s", exc, exc_info=True)
+        return Response(
+            {"error": "Falta configurar Cloudflare R2 en el servidor."},
+            status=status.HTTP_409_CONFLICT,
+        )
+
+    file.seek(0)
+    object_key = f"{settings.R2_DOWNLOAD_PREFIX}/{uuid4()}-{safe_filename(file.name)}"
 
     try:
-        response = requests.post(
-            upload_url,
-            data={
-                **{key: value for key, value in upload_params.items() if value},
-                "api_key": credentials["api_key"],
-                "signature": signature,
-            },
-            files={"file": (file.name, file.file, file.content_type)},
-            timeout=60,
+        client.upload_fileobj(
+            file,
+            settings.R2_BUCKET_NAME,
+            object_key,
+            ExtraArgs={"ContentType": content_type},
         )
-    except requests.RequestException as exc:
-        logger.error("Cloudinary download upload request failed: %s", exc, exc_info=True)
-        return Response({"error": "No se pudo subir el archivo."}, status=status.HTTP_502_BAD_GATEWAY)
-
-    if not response.ok:
-        message = cloudinary_error(response, "No se pudo subir el archivo a Cloudinary.")
-        logger.error(
-            "Cloudinary raw upload failed: status=%s message=%s body=%s",
-            response.status_code,
-            message,
-            response.text[:1000],
-        )
+    except Exception as exc:
+        logger.error("R2 upload failed", exc_info=True)
         return Response(
-            {"error": message},
+            {"error": "No se pudo subir el archivo a R2."},
             status=status.HTTP_502_BAD_GATEWAY,
         )
 
-    try:
-        data = response.json()
-    except ValueError:
-        logger.error(
-            "Cloudinary raw upload returned non-JSON response: status=%s body=%s",
-            response.status_code,
-            response.text[:1000],
-        )
-        return Response(
-            {"error": "Cloudinary devolvio una respuesta invalida al subir el archivo."},
-            status=status.HTTP_502_BAD_GATEWAY,
-        )
-
-    secure_url = data.get("secure_url")
-    if not secure_url:
-        logger.error("Cloudinary raw upload response without secure_url: %s", data)
-        return Response(
-            {"error": "Cloudinary no devolvio una URL valida para el archivo."},
-            status=status.HTTP_502_BAD_GATEWAY,
-        )
+    download_url = f"{settings.R2_PUBLIC_BASE_URL.rstrip('/')}/{object_key}"
 
     return Response(
         {
-            "url": secure_url,
+            "url": download_url,
             "fileName": file.name,
-            "publicId": data.get("public_id"),
+            "objectKey": object_key,
             "contentType": file.content_type,
-            "bytes": data.get("bytes", file.size),
-            "resourceType": data.get("resource_type"),
-            "format": data.get("format"),
+            "bytes": file.size,
+            "storage": "r2",
         }
     )
 
