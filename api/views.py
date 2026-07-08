@@ -1609,11 +1609,109 @@ def admin_download_upload_view(request):
             "url": download_url,
             "fileName": file.name,
             "objectKey": object_key,
+            "publicId": object_key,
             "contentType": file.content_type,
             "bytes": file.size,
             "storage": "r2",
         }
     )
+
+
+def extract_r2_object_key(url=None, object_key=None):
+    if object_key:
+        key = object_key.strip().lstrip("/")
+    elif url:
+        base = settings.R2_PUBLIC_BASE_URL.rstrip("/")
+        if not url.startswith(base):
+            return None
+        from urllib.parse import unquote
+        key = unquote(url[len(base):].lstrip("/"))
+    else:
+        return None
+
+    if not key:
+        return None
+
+    prefix = settings.R2_DOWNLOAD_PREFIX
+    if not key.startswith(prefix):
+        return None
+
+    return key
+
+
+@api_view(["POST"])
+@permission_classes([IsEnvAdmin])
+def admin_download_delete_view(request):
+    url = request.data.get("url", "").strip()
+    object_key = request.data.get("objectKey", "").strip()
+
+    key = extract_r2_object_key(url=url or None, object_key=object_key or None)
+    if not key:
+        return Response(
+            {"error": "No se pudo identificar el archivo en R2."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    if not all([
+        settings.R2_ACCOUNT_ID,
+        settings.R2_ACCESS_KEY_ID,
+        settings.R2_SECRET_ACCESS_KEY,
+        settings.R2_BUCKET_NAME,
+    ]):
+        return Response(
+            {"error": "Falta configurar Cloudflare R2 en el servidor."},
+            status=status.HTTP_409_CONFLICT,
+        )
+
+    try:
+        client = get_r2_client()
+    except Exception as exc:
+        logger.error("Failed to initialize R2 client: %s", exc, exc_info=True)
+        return Response(
+            {"error": "Falta configurar Cloudflare R2 en el servidor."},
+            status=status.HTTP_409_CONFLICT,
+        )
+
+    logger.info("R2 download delete requested: key=%s", key)
+
+    try:
+        client.head_object(Bucket=settings.R2_BUCKET_NAME, Key=key)
+        exists = True
+    except Exception as exc:
+        error_code = getattr(exc, "response", {}).get("Error", {}).get("Code", "")
+        if error_code == "NotFound" or getattr(exc, "__class__.__name__", "") == "ClientError":
+            exists = False
+        else:
+            logger.error("R2 delete failed", exc_info=True)
+            return Response(
+                {"error": "No se pudo eliminar el archivo de R2."},
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
+
+    if not exists:
+        return Response(
+            {
+                "ok": True,
+                "deleted": False,
+                "objectKey": key,
+                "message": "El archivo ya no existia en R2.",
+            }
+        )
+
+    try:
+        client.delete_object(Bucket=settings.R2_BUCKET_NAME, Key=key)
+    except Exception as exc:
+        logger.error("R2 delete failed", exc_info=True)
+        return Response(
+            {"error": "No se pudo eliminar el archivo de R2."},
+            status=status.HTTP_502_BAD_GATEWAY,
+        )
+
+    return Response({
+        "ok": True,
+        "deleted": True,
+        "objectKey": key,
+    })
 
 
 class ProductListCreateView(generics.ListCreateAPIView):
