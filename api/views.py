@@ -1535,9 +1535,17 @@ def safe_filename(filename):
 @permission_classes([IsEnvAdmin])
 @parser_classes([MultiPartParser, FormParser])
 def admin_download_upload_view(request):
+    logger.info("Download upload request started")
     file = request.FILES.get("file")
     if not file:
         return Response({"error": "Falta el archivo."}, status=status.HTTP_400_BAD_REQUEST)
+
+    logger.info(
+        "Download upload file received: name=%s size=%s content_type=%s",
+        file.name,
+        file.size,
+        file.content_type,
+    )
 
     extension = Path(file.name).suffix.lower()
     content_type = (file.content_type or "").lower()
