@@ -20,6 +20,7 @@ urlpatterns = [
     path("admin/uploads/image/delete", views.admin_image_delete_view, name="admin-image-delete"),
     path("admin/uploads/download", views.admin_download_upload_view, name="admin-download-upload"),
     path("admin/uploads/download/delete", views.admin_download_delete_view, name="admin-download-delete"),
+    path("admin/products/import-bundle/preview", views.admin_product_import_bundle_preview_view, name="admin-product-import-bundle-preview"),
     path("admin/products/import-bundle", views.admin_product_import_bundle_view, name="admin-product-import-bundle"),
     path("admin/products", views.AdminProductListCreateView.as_view(), name="admin-products"),
     path("admin/products/<uuid:pk>", views.AdminProductDetailUpdateDestroyView.as_view(), name="admin-product-detail"),

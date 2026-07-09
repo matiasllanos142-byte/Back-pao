@@ -212,6 +212,7 @@ class ProductSerializer(serializers.ModelSerializer):
 
 class ProductListSerializer(serializers.ModelSerializer):
     category = serializers.SlugRelatedField(read_only=True, slug_field="slug")
+    galleryImages = serializers.SerializerMethodField()
 
     class Meta:
         model = Product
@@ -230,7 +231,23 @@ class ProductListSerializer(serializers.ModelSerializer):
             "features",
             "objectives",
             "created_at",
+            "galleryImages",
         ]
+
+    def get_galleryImages(self, obj):
+        raw = obj.metadata.get("gallery_images", []) if isinstance(obj.metadata, dict) else []
+        if not isinstance(raw, list):
+            return []
+        sanitized = []
+        for item in raw:
+            if isinstance(item, dict) and item.get("url"):
+                sanitized.append({
+                    "url": item["url"],
+                    "fileName": item.get("fileName", ""),
+                    "order": item.get("order", 0),
+                })
+        sanitized.sort(key=lambda x: x["order"])
+        return sanitized
 
 
 class PurchasedProductSerializer(serializers.ModelSerializer):
