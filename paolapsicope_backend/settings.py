@@ -130,6 +130,7 @@ MP_ACCESS_TOKEN = os.environ.get("MP_ACCESS_TOKEN", "")
 MP_WEBHOOK_SECRET = os.environ.get("MP_WEBHOOK_SECRET", "")
 MP_MODE = os.environ.get("MP_MODE", "auto").strip().lower()
 FRONTEND_URL = public_frontend_url(os.environ.get("FRONTEND_URL", "http://localhost:3000"))
+EMAIL_ASSETS_BASE_URL = os.environ.get("EMAIL_ASSETS_BASE_URL", "").rstrip("/")
 
 INSTALLED_APPS = [
     "django.contrib.admin",

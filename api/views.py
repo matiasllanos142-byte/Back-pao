@@ -64,10 +64,17 @@ from .admin_auth import (
 from .email_service import (
     EmailDeliveryError,
     read_email_verification_token,
+    send_abandoned_cart_email,
+    send_download_help_email,
+    send_download_ready_email,
+    send_new_product_email,
     send_password_reset_code_email,
+    send_product_updated_email,
     send_purchase_confirmation_email,
     send_registration_code_email,
+    send_support_received_email,
     send_verification_email,
+    send_welcome_email,
 )
 from .cloudinary_settings import (
     get_cloudinary_credentials,
