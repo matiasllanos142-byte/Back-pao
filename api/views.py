@@ -2460,39 +2460,51 @@ def admin_product_import_bundle_view(request):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        title = (manifest_data.get("title") or "").strip()
-        description = (manifest_data.get("description") or "").strip()
-        category_slug = (manifest_data.get("category") or "").strip()
-        price = manifest_data.get("price")
-        compare_at_price = manifest_data.get("compareAtPrice")
-        age = (manifest_data.get("age") or "").strip()
-        level = (manifest_data.get("level") or "").strip()
-        badge = (manifest_data.get("badge") or "").strip() or None
-        featured = bool(manifest_data.get("featured", False))
-        features = manifest_data.get("features", [])
-        objectives = manifest_data.get("objectives", [])
-        cover_file = (manifest_data.get("coverFile") or "").strip()
-        download_file = (manifest_data.get("downloadFile") or "").strip()
-        download_display_name = (manifest_data.get("downloadFileName") or "").strip()
+        # Read product and assets from manifest (nested structure)
+        product_raw = manifest_data.get("product")
+        if not isinstance(product_raw, dict):
+            product_raw = manifest_data  # fallback to legacy flat format
+        assets_raw = manifest_data.get("assets")
+        if not isinstance(assets_raw, dict):
+            assets_raw = manifest_data  # fallback to legacy flat format
+
+        title = (product_raw.get("title") or "").strip()
+        description = (product_raw.get("description") or "").strip()
+        category_slug = (product_raw.get("category") or "").strip()
+        price = product_raw.get("price")
+        compare_at_price = product_raw.get("compareAtPrice")
+        age = (product_raw.get("age") or "").strip()
+        level = (product_raw.get("level") or "").strip()
+        badge = (product_raw.get("badge") or "").strip() or None
+        featured = bool(product_raw.get("featured", False))
+        features = product_raw.get("features", [])
+        objectives = product_raw.get("objectives", [])
+        cover_path = (assets_raw.get("coverImage") or "").strip()
+        download_path = (assets_raw.get("downloadFile") or "").strip()
+        gallery_manifest = assets_raw.get("galleryImages", [])
 
         warnings = []
         errors = {}
+
+        def _add_error(field_key, message):
+            errors[field_key] = message
+
         if not title:
-            errors["title"] = "El titulo es obligatorio."
+            _add_error("manifest.product.title", "El titulo es obligatorio.")
         if not description:
-            errors["description"] = "La descripcion es obligatoria."
+            _add_error("manifest.product.description", "La descripcion es obligatoria.")
         if not category_slug:
-            errors["category"] = "La categoria es obligatoria."
+            _add_error("manifest.product.category", "La categoria es obligatoria.")
         if price is None or price == "":
-            errors["price"] = "El precio es obligatorio."
+            _add_error("manifest.product.price", "El precio es obligatorio.")
         if not age:
-            errors["age"] = "La edad es obligatoria."
+            _add_error("manifest.product.age", "La edad es obligatoria.")
         if not level:
-            errors["level"] = "El nivel es obligatorio."
-        if not cover_file:
-            errors["coverFile"] = "El archivo de portada es obligatorio."
-        if not download_file:
-            errors["downloadFile"] = "El archivo descargable es obligatorio."
+            _add_error("manifest.product.level", "El nivel es obligatorio.")
+        if not cover_path:
+            _add_error("manifest.assets.coverImage", "El archivo de portada es obligatorio.")
+        if not download_path:
+            _add_error("manifest.assets.downloadFile", "El archivo descargable es obligatorio.")
 
         if errors:
             return Response({"error": errors}, status=status.HTTP_400_BAD_REQUEST)
@@ -2503,7 +2515,8 @@ def admin_product_import_bundle_view(request):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        cover_ext = Path(cover_file).suffix.lower()
+        cover_file_name = Path(cover_path).name
+        cover_ext = Path(cover_file_name).suffix.lower()
         if cover_ext not in VALID_COVER_EXTENSIONS:
             return Response(
                 {"error": f"Formato de portada no soportado: '{cover_ext}'. Usa: {', '.join(sorted(VALID_COVER_EXTENSIONS))}."},
@@ -2512,16 +2525,17 @@ def admin_product_import_bundle_view(request):
 
         cover_name = None
         for name in zf.namelist():
-            if Path(name).name == cover_file:
+            if Path(name).name == cover_file_name:
                 cover_name = name
                 break
         if not cover_name:
             return Response(
-                {"error": f"Archivo de portada no encontrado en el ZIP: '{cover_file}'."},
+                {"error": f"Archivo de portada no encontrado en el ZIP: '{cover_path}'."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        download_ext = Path(download_file).suffix.lower()
+        download_file_name = Path(download_path).name
+        download_ext = Path(download_file_name).suffix.lower()
         if download_ext not in {".pdf", ".zip"}:
             return Response(
                 {"error": "El archivo descargable debe ser PDF o ZIP."},
@@ -2530,29 +2544,23 @@ def admin_product_import_bundle_view(request):
 
         download_name = None
         for name in zf.namelist():
-            if Path(name).name == download_file:
+            if Path(name).name == download_file_name:
                 download_name = name
                 break
         if not download_name:
             return Response(
-                {"error": f"Archivo descargable no encontrado en el ZIP: '{download_file}'."},
+                {"error": f"Archivo descargable no encontrado en el ZIP: '{download_path}'."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        # Detect gallery images
-        gallery_images = [
-            Path(name).as_posix()
-            for name in zf.namelist()
-            if name != cover_name
-            and Path(name).suffix.lower() in VALID_COVER_EXTENSIONS
-            and (
-                Path(name).as_posix().startswith("gallery/")
-                or Path(name).as_posix().startswith("gallery\\")
-            )
-        ]
-        if gallery_images:
+        download_display_name = (assets_raw.get("downloadFileName") or "").strip()
+        if not download_display_name:
+            download_display_name = download_file_name
+
+        # Gallery from manifest
+        if isinstance(gallery_manifest, list) and gallery_manifest:
             warnings.append(
-                f"Se encontraron {len(gallery_images)} imagen(es) de galeria. "
+                f"Se encontraron {len(gallery_manifest)} imagen(es) de galeria. "
                 "Las imagenes de galeria no se importan en esta version."
             )
 
@@ -2569,12 +2577,12 @@ def admin_product_import_bundle_view(request):
 
     try:
         cloudinary_result = _upload_image_to_cloudinary_from_bytes(
-            cover_bytes, cover_file, cover_content_type
+            cover_bytes, cover_file_name, cover_content_type
         )
         uploaded_cloudinary_public_id = cloudinary_result["publicId"]
 
         r2_result = _upload_download_to_r2_from_bytes(
-            download_bytes, download_file, download_content_type
+            download_bytes, download_file_name, download_content_type
         )
         uploaded_r2_object_key = r2_result["objectKey"]
 
@@ -2587,7 +2595,7 @@ def admin_product_import_bundle_view(request):
             "image": cloudinary_result["url"],
             "image_public_id": cloudinary_result["publicId"],
             "download_url": r2_result["url"],
-            "download_filename": download_display_name or download_file,
+            "download_filename": download_display_name or download_file_name,
             "download_public_id": r2_result["objectKey"],
             "download_content_type": download_content_type,
             "download_size": len(download_bytes),
