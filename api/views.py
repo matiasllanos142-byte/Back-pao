@@ -2676,6 +2676,35 @@ def admin_product_import_bundle_view(request):
         if not isinstance(assets_raw, dict):
             assets_raw = manifest_data  # fallback to legacy flat format
 
+        # Apply overrides from request (if any)
+        overrides_raw = request.data.get("overrides")
+        if overrides_raw:
+            try:
+                overrides_data = json.loads(overrides_raw) if isinstance(overrides_raw, str) else overrides_raw
+            except (json.JSONDecodeError, TypeError):
+                return Response(
+                    {"error": "overrides debe ser un JSON valido."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            if not isinstance(overrides_data, dict):
+                return Response(
+                    {"error": "overrides debe ser un objeto JSON."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            if "assets" in overrides_data:
+                return Response(
+                    {"error": "overrides.assets no esta permitido. Los assets se leen del ZIP."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            if isinstance(overrides_data.get("product"), dict):
+                merged_product = dict(product_raw)
+                override_product = overrides_data["product"]
+                allowed_override_keys = {"title", "description", "price", "compareAtPrice", "category", "level", "age", "badge", "featured", "features", "objectives"}
+                for key, value in override_product.items():
+                    if key in allowed_override_keys:
+                        merged_product[key] = value
+                product_raw = merged_product
+
         title = (product_raw.get("title") or "").strip()
         description = (product_raw.get("description") or "").strip()
         category_slug = (product_raw.get("category") or "").strip()
