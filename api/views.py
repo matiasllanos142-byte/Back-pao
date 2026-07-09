@@ -7,9 +7,11 @@ import secrets
 import logging
 from datetime import timedelta
 from decimal import Decimal
+from io import BytesIO
 from pathlib import Path
 from uuid import uuid4
 from urllib.parse import urlparse
+import zipfile
 from rest_framework import status, generics
 from rest_framework.decorators import api_view, parser_classes, permission_classes
 from rest_framework.parsers import FormParser, MultiPartParser
@@ -2244,3 +2246,406 @@ def payment_webhook_view(request):
         "orderId": str(order.id) if order else "",
         "orderStatus": order.status if order else "",
     })
+
+
+# --- Import Bundle ---
+
+VALID_COVER_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".avif"}
+COVER_MIME_MAP = {
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".png": "image/png",
+    ".webp": "image/webp",
+    ".gif": "image/gif",
+    ".avif": "image/avif",
+}
+ZIP_MAX_BYTES = 50 * 1024 * 1024  # 50 MB
+EXECUTABLE_EXTENSIONS = {".exe", ".bat", ".cmd", ".com", ".msi", ".scr", ".pif", ".sh", ".bin", ".app"}
+BUNDLE_SCHEMA_VERSION = "paola-product-bundle-v1"
+VALID_LEVELS = {"Inicial", "Intermedio", "Avanzado"}
+
+
+def _upload_image_to_cloudinary_from_bytes(file_bytes, filename, content_type):
+    credentials = get_cloudinary_credentials()
+    if not credentials:
+        raise ValueError("Configura Cloudinary en Ajustes antes de subir imagenes.")
+
+    timestamp = int(time.time())
+    upload_params = {
+        "timestamp": timestamp,
+        "folder": settings.CLOUDINARY_UPLOAD_FOLDER,
+    }
+    signature = sign_cloudinary_upload(upload_params, credentials["api_secret"])
+    upload_url = f"https://api.cloudinary.com/v1_1/{credentials['cloud_name']}/image/upload"
+
+    try:
+        response = requests.post(
+            upload_url,
+            data={
+                **{key: value for key, value in upload_params.items() if value},
+                "api_key": credentials["api_key"],
+                "signature": signature,
+            },
+            files={"file": (filename, BytesIO(file_bytes), content_type)},
+            timeout=30,
+        )
+    except requests.RequestException as exc:
+        logger.error("Cloudinary upload request failed: %s", exc, exc_info=True)
+        raise ValueError("No se pudo conectar con Cloudinary.") from exc
+
+    if response.status_code >= 400:
+        msg = cloudinary_error(response, "Cloudinary rechazo la imagen.")
+        raise ValueError(msg)
+
+    data = response.json()
+    secure_url = data.get("secure_url")
+    if not secure_url:
+        raise ValueError("Cloudinary no devolvio una URL valida.")
+
+    return {"url": secure_url, "publicId": data.get("public_id")}
+
+
+def _cloudinary_delete_image(public_id):
+    if not public_id:
+        return False
+    credentials = get_cloudinary_credentials()
+    if not credentials:
+        return False
+
+    timestamp = int(time.time())
+    destroy_params = {
+        "public_id": public_id,
+        "timestamp": timestamp,
+        "invalidate": "true",
+    }
+    signature = sign_cloudinary_upload(destroy_params, credentials["api_secret"])
+    destroy_url = f"https://api.cloudinary.com/v1_1/{credentials['cloud_name']}/image/destroy"
+
+    try:
+        response = requests.post(
+            destroy_url,
+            data={
+                "public_id": public_id,
+                "timestamp": timestamp,
+                "invalidate": "true",
+                "api_key": credentials["api_key"],
+                "signature": signature,
+            },
+            timeout=30,
+        )
+        return response.ok and response.json().get("result") == "ok"
+    except Exception:
+        logger.exception("Cloudinary rollback delete failed for public_id=%s", public_id)
+        return False
+
+
+def _upload_download_to_r2_from_bytes(file_bytes, filename, content_type):
+    client = get_r2_client()
+    if not client:
+        raise ValueError("Falta configurar Cloudflare R2 en el servidor.")
+
+    safe_name = safe_filename(filename)
+    object_key = f"{settings.R2_DOWNLOAD_PREFIX}/{uuid4()}-{safe_name}"
+
+    buf = BytesIO(file_bytes)
+    try:
+        client.upload_fileobj(
+            buf,
+            settings.R2_BUCKET_NAME,
+            object_key,
+            ExtraArgs={"ContentType": content_type},
+        )
+    except Exception as exc:
+        logger.error("R2 upload failed", exc_info=True)
+        raise ValueError("No se pudo subir el archivo a R2.") from exc
+
+    download_url = f"{settings.R2_PUBLIC_BASE_URL.rstrip('/')}/{object_key}"
+
+    return {
+        "url": download_url,
+        "fileName": filename,
+        "objectKey": object_key,
+        "publicId": object_key,
+        "contentType": content_type,
+        "bytes": len(file_bytes),
+        "storage": "r2",
+    }
+
+
+def _r2_delete_object(object_key):
+    if not object_key:
+        return False
+    client = get_r2_client()
+    if not client:
+        return False
+    try:
+        client.head_object(Bucket=settings.R2_BUCKET_NAME, Key=object_key)
+    except Exception:
+        return False
+    try:
+        client.delete_object(Bucket=settings.R2_BUCKET_NAME, Key=object_key)
+        return True
+    except Exception:
+        logger.exception("R2 rollback delete failed for key=%s", object_key)
+        return False
+
+
+@api_view(["POST"])
+@permission_classes([IsEnvAdmin])
+@parser_classes([MultiPartParser, FormParser])
+def admin_product_import_bundle_view(request):
+    zip_file = request.FILES.get("file")
+    if not zip_file:
+        return Response({"error": "Falta el archivo ZIP."}, status=status.HTTP_400_BAD_REQUEST)
+
+    if not zip_file.name.lower().endswith(".zip"):
+        return Response({"error": "El archivo debe tener extension .zip."}, status=status.HTTP_400_BAD_REQUEST)
+
+    if zip_file.size > ZIP_MAX_BYTES:
+        return Response(
+            {"error": "El archivo ZIP supera el maximo permitido de 50 MB."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    try:
+        zip_data = zip_file.read()
+        zf = zipfile.ZipFile(BytesIO(zip_data))
+    except zipfile.BadZipFile:
+        return Response(
+            {"error": "El archivo ZIP esta corrupto o no es valido."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    try:
+        for name in zf.namelist():
+            normalized = Path(name).as_posix()
+            if normalized.startswith("/") or ".." in normalized.split("/"):
+                return Response(
+                    {"error": f"El archivo ZIP contiene rutas no seguras: {name}"},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            ext = Path(name).suffix.lower()
+            if ext in EXECUTABLE_EXTENSIONS:
+                return Response(
+                    {"error": f"El archivo ZIP contiene archivos ejecutables no permitidos: {name}"},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+        manifest_files = [name for name in zf.namelist() if Path(name).name == "manifest.json"]
+        if not manifest_files:
+            return Response(
+                {"error": "El ZIP debe contener un archivo manifest.json en la raiz."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        manifest_name = manifest_files[0]
+        for name in manifest_files:
+            if Path(name).parent == Path("."):
+                manifest_name = name
+                break
+
+        try:
+            manifest_data = json.loads(zf.read(manifest_name))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return Response(
+                {"error": "manifest.json no es un JSON valido."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        schema_version = manifest_data.get("schemaVersion", "")
+        if schema_version != BUNDLE_SCHEMA_VERSION:
+            return Response(
+                {"error": f"Version de esquema no soportada: '{schema_version}'. Se espera '{BUNDLE_SCHEMA_VERSION}'."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        title = (manifest_data.get("title") or "").strip()
+        description = (manifest_data.get("description") or "").strip()
+        category_slug = (manifest_data.get("category") or "").strip()
+        price = manifest_data.get("price")
+        compare_at_price = manifest_data.get("compareAtPrice")
+        age = (manifest_data.get("age") or "").strip()
+        level = (manifest_data.get("level") or "").strip()
+        badge = (manifest_data.get("badge") or "").strip() or None
+        featured = bool(manifest_data.get("featured", False))
+        features = manifest_data.get("features", [])
+        objectives = manifest_data.get("objectives", [])
+        cover_file = (manifest_data.get("coverFile") or "").strip()
+        download_file = (manifest_data.get("downloadFile") or "").strip()
+        download_display_name = (manifest_data.get("downloadFileName") or "").strip()
+
+        warnings = []
+        errors = {}
+        if not title:
+            errors["title"] = "El titulo es obligatorio."
+        if not description:
+            errors["description"] = "La descripcion es obligatoria."
+        if not category_slug:
+            errors["category"] = "La categoria es obligatoria."
+        if price is None or price == "":
+            errors["price"] = "El precio es obligatorio."
+        if not age:
+            errors["age"] = "La edad es obligatoria."
+        if not level:
+            errors["level"] = "El nivel es obligatorio."
+        if not cover_file:
+            errors["coverFile"] = "El archivo de portada es obligatorio."
+        if not download_file:
+            errors["downloadFile"] = "El archivo descargable es obligatorio."
+
+        if errors:
+            return Response({"error": errors}, status=status.HTTP_400_BAD_REQUEST)
+
+        if level not in VALID_LEVELS:
+            return Response(
+                {"error": f"Nivel no valido: '{level}'. Debe ser uno de: {', '.join(sorted(VALID_LEVELS))}."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        cover_ext = Path(cover_file).suffix.lower()
+        if cover_ext not in VALID_COVER_EXTENSIONS:
+            return Response(
+                {"error": f"Formato de portada no soportado: '{cover_ext}'. Usa: {', '.join(sorted(VALID_COVER_EXTENSIONS))}."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        cover_name = None
+        for name in zf.namelist():
+            if Path(name).name == cover_file:
+                cover_name = name
+                break
+        if not cover_name:
+            return Response(
+                {"error": f"Archivo de portada no encontrado en el ZIP: '{cover_file}'."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        download_ext = Path(download_file).suffix.lower()
+        if download_ext not in {".pdf", ".zip"}:
+            return Response(
+                {"error": "El archivo descargable debe ser PDF o ZIP."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        download_name = None
+        for name in zf.namelist():
+            if Path(name).name == download_file:
+                download_name = name
+                break
+        if not download_name:
+            return Response(
+                {"error": f"Archivo descargable no encontrado en el ZIP: '{download_file}'."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # Detect gallery images
+        gallery_images = [
+            Path(name).as_posix()
+            for name in zf.namelist()
+            if name != cover_name
+            and Path(name).suffix.lower() in VALID_COVER_EXTENSIONS
+            and (
+                Path(name).as_posix().startswith("gallery/")
+                or Path(name).as_posix().startswith("gallery\\")
+            )
+        ]
+        if gallery_images:
+            warnings.append(
+                f"Se encontraron {len(gallery_images)} imagen(es) de galeria. "
+                "Las imagenes de galeria no se importan en esta version."
+            )
+
+        cover_bytes = zf.read(cover_name)
+        download_bytes = zf.read(download_name)
+    finally:
+        zf.close()
+
+    cover_content_type = COVER_MIME_MAP.get(cover_ext, "image/png")
+    download_content_type = "application/pdf" if download_ext == ".pdf" else "application/zip"
+
+    uploaded_cloudinary_public_id = None
+    uploaded_r2_object_key = None
+
+    try:
+        cloudinary_result = _upload_image_to_cloudinary_from_bytes(
+            cover_bytes, cover_file, cover_content_type
+        )
+        uploaded_cloudinary_public_id = cloudinary_result["publicId"]
+
+        r2_result = _upload_download_to_r2_from_bytes(
+            download_bytes, download_file, download_content_type
+        )
+        uploaded_r2_object_key = r2_result["objectKey"]
+
+        product_data = {
+            "title": title,
+            "description": description,
+            "price": str(price),
+            "compare_at_price": str(compare_at_price) if compare_at_price else None,
+            "category": category_slug,
+            "image": cloudinary_result["url"],
+            "image_public_id": cloudinary_result["publicId"],
+            "download_url": r2_result["url"],
+            "download_filename": download_display_name or download_file,
+            "download_public_id": r2_result["objectKey"],
+            "download_content_type": download_content_type,
+            "download_size": len(download_bytes),
+            "badge": badge,
+            "featured": featured,
+            "age": age,
+            "level": level,
+            "features": features if isinstance(features, list) else [],
+            "objectives": objectives if isinstance(objectives, list) else [],
+            "metadata": {
+                "imported_from_zip": True,
+                "bundle_schema_version": schema_version,
+            },
+        }
+
+        serializer = ProductSerializer(data=product_data)
+        if not serializer.is_valid():
+            if uploaded_r2_object_key:
+                _r2_delete_object(uploaded_r2_object_key)
+            if uploaded_cloudinary_public_id:
+                _cloudinary_delete_image(uploaded_cloudinary_public_id)
+            return Response(
+                {"error": serializer.errors, "created": False},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        product = serializer.save()
+
+        return Response(
+            {
+                "created": True,
+                "product": serializer.data,
+                "uploads": {
+                    "image": cloudinary_result,
+                    "download": r2_result,
+                },
+                "warnings": warnings,
+            },
+            status=status.HTTP_201_CREATED,
+        )
+
+    except ValueError as exc:
+        if uploaded_r2_object_key:
+            _r2_delete_object(uploaded_r2_object_key)
+        if uploaded_cloudinary_public_id:
+            _cloudinary_delete_image(uploaded_cloudinary_public_id)
+        return Response(
+            {"error": str(exc), "created": False},
+            status=status.HTTP_502_BAD_GATEWAY,
+        )
+
+    except Exception as exc:
+        if uploaded_r2_object_key:
+            _r2_delete_object(uploaded_r2_object_key)
+        if uploaded_cloudinary_public_id:
+            _cloudinary_delete_image(uploaded_cloudinary_public_id)
+        logger.error("Import bundle unexpected error: %s", exc, exc_info=True)
+        return Response(
+            {"error": "Error inesperado al importar el producto."},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
