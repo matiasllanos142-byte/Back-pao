@@ -4,6 +4,7 @@ from urllib.parse import urlparse
 import requests
 from django.conf import settings
 from django.core import signing
+from django.utils import timezone
 from django.utils.html import escape
 
 from .email_templates import render_email_template
@@ -76,9 +77,80 @@ def build_frontend_url(path):
     return f"{base_url}{path}"
 
 
+def _email_notification(message):
+    existing = message.get("notification")
+    if existing is not None:
+        return existing
+
+    from .models import Notification, User, UserEvent
+
+    recipient = str(message["to"]).lower().strip()
+    user = message.get("user") or User.objects.filter(email__iexact=recipient).first()
+    notification = Notification.objects.create(
+        user=user,
+        order=message.get("order"),
+        type=message.get("notificationType", "transactional_email"),
+        channel="email",
+        recipient=recipient,
+        status="pending",
+        metadata=message.get("notificationMetadata") or {},
+    )
+    if user:
+        UserEvent.objects.create(
+            user=user,
+            event_type="email_queued",
+            entity_type="notification",
+            entity_id=str(notification.id),
+        )
+    return notification
+
+
+def _email_notification_sent(notification, provider_id):
+    from .models import UserEvent
+
+    notification.status = "sent"
+    notification.provider_message_id = str(provider_id or "")
+    notification.sent_at = timezone.now()
+    notification.failed_at = None
+    notification.error_message = ""
+    notification.attempts += 1
+    notification.save(update_fields=[
+        "status", "provider_message_id", "sent_at", "failed_at",
+        "error_message", "attempts", "updated_at",
+    ])
+    if notification.user:
+        UserEvent.objects.create(
+            user=notification.user,
+            event_type="email_sent",
+            entity_type="notification",
+            entity_id=str(notification.id),
+        )
+
+
+def _email_notification_failed(notification, reason):
+    from .models import UserEvent
+
+    notification.status = "failed"
+    notification.failed_at = timezone.now()
+    notification.error_message = str(reason or "unknown_error")[:500]
+    notification.attempts += 1
+    notification.save(update_fields=[
+        "status", "failed_at", "error_message", "attempts", "updated_at",
+    ])
+    if notification.user:
+        UserEvent.objects.create(
+            user=notification.user,
+            event_type="email_failed",
+            entity_type="notification",
+            entity_id=str(notification.id),
+        )
+
+
 def send_resend_email(message):
+    notification = _email_notification(message)
     if not settings.RESEND_API_KEY:
         logger.warning("RESEND_API_KEY is not configured; email was not sent.")
+        _email_notification_failed(notification, "missing_api_key")
         return {"sent": False, "id": None, "reason": "missing_api_key"}
 
     payload = {
@@ -103,6 +175,7 @@ def send_resend_email(message):
             timeout=settings.RESEND_TIMEOUT_SECONDS,
         )
     except requests.RequestException as exc:
+        _email_notification_failed(notification, "resend_unreachable")
         raise EmailDeliveryError("No se pudo conectar con Resend.") from exc
 
     if response.status_code >= 400:
@@ -119,13 +192,19 @@ def send_resend_email(message):
             response.status_code,
             response.text[:500],
         )
+        _email_notification_failed(notification, reason)
         raise EmailDeliveryError(reason)
 
-    data = response.json()
+    try:
+        data = response.json()
+    except ValueError as exc:
+        _email_notification_failed(notification, "invalid_resend_response")
+        raise EmailDeliveryError("Resend devolvio una respuesta invalida.") from exc
+    _email_notification_sent(notification, data.get("id"))
     return {"sent": True, "id": data.get("id"), "reason": None}
 
 
-def send_purchase_confirmation_email(order):
+def send_purchase_confirmation_email(order, notification=None):
     items = list(order.items.select_related("product"))
     first_product = items[0].product.title if items else "Material comprado"
     order_url = build_frontend_url(f"/perfil#biblioteca")
@@ -145,6 +224,10 @@ def send_purchase_confirmation_email(order):
             "subject": rendered["subject"],
             "html": rendered["html"],
             "text": rendered["text"],
+            "notificationType": "purchase_confirmed",
+            "user": order.user,
+            "order": order,
+            "notification": notification,
         }
     )
 
@@ -167,6 +250,8 @@ def send_verification_email(user, request=None):
             "subject": rendered["subject"],
             "html": rendered["html"],
             "text": rendered["text"],
+            "notificationType": "verify_account",
+            "user": user,
         }
     )
 
@@ -185,6 +270,7 @@ def send_registration_code_email(name, email, code):
             "subject": rendered["subject"],
             "html": rendered["html"],
             "text": rendered["text"],
+            "notificationType": "verify_account",
         }
     )
 
@@ -201,6 +287,7 @@ def send_password_reset_code_email(name, email, code):
             "subject": rendered["subject"],
             "html": rendered["html"],
             "text": rendered["text"],
+            "notificationType": "password_reset",
         }
     )
 
@@ -216,6 +303,7 @@ def send_welcome_email(to_email, name, store_url=None, account_url=None):
         "subject": rendered["subject"],
         "html": rendered["html"],
         "text": rendered["text"],
+        "notificationType": "welcome",
     })
 
 
@@ -232,6 +320,7 @@ def send_download_ready_email(to_email, name, product_title, library_url=None, f
         "subject": rendered["subject"],
         "html": rendered["html"],
         "text": rendered["text"],
+        "notificationType": "download_ready",
     })
 
 
@@ -246,6 +335,7 @@ def send_download_help_email(to_email, name, library_url=None, support_email=Non
         "subject": rendered["subject"],
         "html": rendered["html"],
         "text": rendered["text"],
+        "notificationType": "download_help",
     })
 
 
@@ -262,6 +352,7 @@ def send_new_product_email(to_email, name, product_title, product_description=""
         "subject": rendered["subject"],
         "html": rendered["html"],
         "text": rendered["text"],
+        "notificationType": "new_product",
     })
 
 
@@ -277,6 +368,7 @@ def send_product_updated_email(to_email, name, product_title, changes=None, prod
         "subject": rendered["subject"],
         "html": rendered["html"],
         "text": rendered["text"],
+        "notificationType": "product_updated",
     })
 
 
@@ -292,6 +384,7 @@ def send_abandoned_cart_email(to_email, name, product_title, product_price="", c
         "subject": rendered["subject"],
         "html": rendered["html"],
         "text": rendered["text"],
+        "notificationType": "abandoned_cart",
     })
 
 
@@ -306,4 +399,5 @@ def send_support_received_email(to_email, name, ticket_subject=None, support_ema
         "subject": rendered["subject"],
         "html": rendered["html"],
         "text": rendered["text"],
+        "notificationType": "support_received",
     })
