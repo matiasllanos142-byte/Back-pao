@@ -65,6 +65,9 @@ ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "PaolazabalaPsicope@gmail.com"
 ADMIN_PASSWORD_HASH = os.environ.get("ADMIN_PASSWORD_HASH", "")
 ADMIN_JWT_SECRET = os.environ.get("ADMIN_JWT_SECRET", SECRET_KEY)
 ADMIN_TOKEN_TTL = int(os.environ.get("ADMIN_TOKEN_TTL", "86400"))
+ALLOW_BUILTIN_ADMIN_FALLBACK = (
+    os.environ.get("ALLOW_BUILTIN_ADMIN_FALLBACK", "False").lower() == "true"
+)
 
 CLOUDINARY_CLOUD_NAME = os.environ.get("CLOUDINARY_CLOUD_NAME", "")
 CLOUDINARY_API_KEY = os.environ.get("CLOUDINARY_API_KEY", "")
@@ -74,6 +77,8 @@ CLOUDINARY_UPLOAD_FOLDER = os.environ.get("CLOUDINARY_UPLOAD_FOLDER", "paola-psi
 CLOUDINARY_MAX_UPLOAD_BYTES = int(os.environ.get("CLOUDINARY_MAX_UPLOAD_BYTES", str(5 * 1024 * 1024)))
 CLOUDINARY_DOWNLOAD_FOLDER = os.environ.get("CLOUDINARY_DOWNLOAD_FOLDER", "paola-psicope/downloads")
 CLOUDINARY_MAX_DOWNLOAD_BYTES = int(os.environ.get("CLOUDINARY_MAX_DOWNLOAD_BYTES", str(25 * 1024 * 1024)))
+CLOUDINARY_AVATAR_FOLDER = os.environ.get("CLOUDINARY_AVATAR_FOLDER", "paola-psicope/avatars")
+CLOUDINARY_AVATAR_MAX_BYTES = int(os.environ.get("CLOUDINARY_AVATAR_MAX_BYTES", str(5 * 1024 * 1024)))
 
 DATA_UPLOAD_MAX_MEMORY_SIZE = int(os.environ.get("DATA_UPLOAD_MAX_MEMORY_SIZE", str(120 * 1024 * 1024)))
 FILE_UPLOAD_MAX_MEMORY_SIZE = int(os.environ.get("FILE_UPLOAD_MAX_MEMORY_SIZE", str(120 * 1024 * 1024)))
@@ -129,6 +134,9 @@ EMAIL_VERIFICATION_ERROR_URL = url_with_default_scheme(os.environ.get("EMAIL_VER
 MP_ACCESS_TOKEN = os.environ.get("MP_ACCESS_TOKEN", "")
 MP_WEBHOOK_SECRET = os.environ.get("MP_WEBHOOK_SECRET", "")
 MP_MODE = os.environ.get("MP_MODE", "auto").strip().lower()
+MP_ALLOW_UNSIGNED_WEBHOOKS_IN_DEBUG = (
+    os.environ.get("MP_ALLOW_UNSIGNED_WEBHOOKS_IN_DEBUG", "False").lower() == "true"
+)
 FRONTEND_URL = public_frontend_url(os.environ.get("FRONTEND_URL", "http://localhost:3000"))
 EMAIL_ASSETS_BASE_URL = os.environ.get("EMAIL_ASSETS_BASE_URL", "").rstrip("/")
 

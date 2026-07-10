@@ -18,8 +18,14 @@ PUBLIC_AUTH_PATHS = {
 class JWTCookieAuthentication(JWTAuthentication):
     def _get_verified_user(self, validated_token):
         user = self.get_user(validated_token)
+        if not user.is_active or getattr(user, "disabled_at", None) is not None:
+            raise AuthenticationFailed("Cuenta deshabilitada.")
         if getattr(user, "email_verified", True) is False:
             raise AuthenticationFailed("Email no verificado.")
+
+        token_version = validated_token.get("token_version", 0)
+        if token_version != getattr(user, "auth_token_version", 0):
+            raise AuthenticationFailed("Token invalido o expirado.")
         return user
 
     def authenticate(self, request):
@@ -54,4 +60,4 @@ class JWTCookieAuthentication(JWTAuthentication):
             user = self._get_verified_user(validated_token)
             return (user, validated_token)
         except Exception as exc:
-            raise AuthenticationFailed("Token inválido o expirado.") from exc
+            raise AuthenticationFailed("Token invalido o expirado.") from exc

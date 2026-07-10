@@ -2,6 +2,7 @@ from datetime import datetime, timedelta, timezone
 
 import jwt
 from django.conf import settings
+from django.contrib.auth import get_user_model
 from django.contrib.auth.hashers import check_password
 
 
@@ -12,6 +13,8 @@ BUILT_IN_ADMIN_PASSWORD_HASH = (
     "pbkdf2_sha256$600000$HU0KwzsR4Cm0iCbPeutpY3$"
     "e0l5TlAwAYrbypfjiyQl6/kGW5+SKFLW04lo8a4Rr5s="
 )
+
+UserModel = get_user_model()
 
 
 def _cookie_secure():
@@ -44,7 +47,22 @@ def _canonical_admin_username(username):
     if expected_username and cleaned.lower() == expected_username.lower():
         return expected_username
 
-    if cleaned.lower() == BUILT_IN_ADMIN_USERNAME.lower():
+    try:
+        admin_user = UserModel.objects.filter(
+            email__iexact=cleaned,
+            is_admin=True,
+            is_active=True,
+            disabled_at__isnull=True,
+        ).first()
+        if admin_user:
+            return admin_user.email
+    except Exception:
+        pass
+
+    if (
+        getattr(settings, "ALLOW_BUILTIN_ADMIN_FALLBACK", False)
+        and cleaned.lower() == BUILT_IN_ADMIN_USERNAME.lower()
+    ):
         return BUILT_IN_ADMIN_USERNAME
 
     return None
@@ -63,8 +81,22 @@ def verify_admin_credentials(username, password):
     ):
         return True
 
+    try:
+        admin_user = UserModel.objects.filter(
+            email__iexact=cleaned_username,
+            is_admin=True,
+            is_active=True,
+            disabled_at__isnull=True,
+        ).first()
+        if admin_user:
+            return admin_user.check_password(password)
+    except Exception:
+        pass
+
     return (
-        cleaned_username == BUILT_IN_ADMIN_USERNAME.lower()
+        getattr(settings, "ALLOW_BUILTIN_ADMIN_FALLBACK", False)
+        and settings.DEBUG
+        and cleaned_username == BUILT_IN_ADMIN_USERNAME.lower()
         and check_password(password, BUILT_IN_ADMIN_PASSWORD_HASH)
     )
 
@@ -80,7 +112,11 @@ def _get_bearer_token(request):
 def create_admin_token(username):
     now = datetime.now(timezone.utc)
     expires_at = now + timedelta(seconds=getattr(settings, "ADMIN_TOKEN_TTL", 86400))
-    subject = _canonical_admin_username(username) or _admin_username() or BUILT_IN_ADMIN_USERNAME
+    subject = (
+        _canonical_admin_username(username)
+        or _admin_username()
+        or BUILT_IN_ADMIN_USERNAME
+    )
     payload = {
         "sub": subject,
         "role": "admin",
