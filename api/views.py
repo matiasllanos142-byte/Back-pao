@@ -22,7 +22,8 @@ from django.contrib.auth import get_user_model
 from django.contrib.auth.hashers import check_password, make_password
 from django.core import signing
 from django.db import transaction
-from django.db.models import Count, Sum, Q
+from django.db.models import Count, DecimalField, IntegerField, OuterRef, Q, Subquery, Sum, Value
+from django.db.models.functions import Coalesce
 from django.http import HttpResponse
 from django.shortcuts import redirect
 from django.shortcuts import get_object_or_404
@@ -35,15 +36,21 @@ logger = logging.getLogger(__name__)
 from .models import (
     Category,
     NvidiaSettings,
-    Product,
+    Notification,
     Order,
     OrderItem,
     PasswordResetRequest,
+    Payment,
+    PaymentEvent,
     PendingRegistration,
+    Product,
     PurchasedProduct,
+    UserEvent,
+    UserProfile,
     WorkbookDraft,
 )
 from .serializers import (
+    ChangePasswordSerializer,
     UserSerializer,
     RegisterSerializer,
     CategorySerializer,
@@ -101,7 +108,9 @@ COOKIE_MAX_AGE = 60 * 60 * 24 * 7  # 7 días
 
 
 def make_auth_token(user):
-    return str(AccessToken.for_user(user))
+    token = AccessToken.for_user(user)
+    token["token_version"] = user.auth_token_version
+    return str(token)
 
 
 def set_auth_cookie(response, user, token=None):
@@ -132,6 +141,31 @@ def pending_registration_expires_at():
 
 def password_reset_expires_at():
     return timezone.now() + timedelta(seconds=settings.PASSWORD_RESET_CODE_TTL_SECONDS)
+
+
+def _record_event(user, event_type, entity_type="", entity_id="", metadata=None):
+    try:
+        UserEvent.objects.create(
+            user=user,
+            event_type=event_type,
+            entity_type=entity_type,
+            entity_id=str(entity_id) if entity_id else "",
+            metadata=metadata or {},
+        )
+    except Exception:
+        logger.exception("Failed to record event %s for user %s", event_type, user)
+
+
+ORDER_STATUS_MAP = {
+    "pendiente": "pending",
+    "completada": "approved",
+    "fallida": "rejected",
+    "reembolsada": "refunded",
+}
+
+
+def map_order_status(internal_status):
+    return ORDER_STATUS_MAP.get(internal_status, "pending")
 
 
 def format_email_delivery_error(exc):
@@ -261,6 +295,8 @@ def verify_registration_code_view(request):
             email_verified_at=timezone.now(),
         )
         pending.delete()
+        _record_event(user, "account_registered", "user", user.id)
+        _record_event(user, "email_verified", "user", user.id)
 
     token = make_auth_token(user)
     response = Response(
@@ -430,13 +466,15 @@ def password_reset_confirm_view(request):
         user.email_verified = True
         if user.email_verified_at is None:
             user.email_verified_at = timezone.now()
-        user.save(update_fields=["password", "email_verified", "email_verified_at", "updated_at"])
+        user.auth_token_version += 1
+        user.save(update_fields=["password", "email_verified", "email_verified_at", "auth_token_version", "updated_at"])
 
         now = timezone.now()
         PasswordResetRequest.objects.filter(
             user=user,
             used_at__isnull=True,
         ).update(used_at=now, updated_at=now)
+        _record_event(user, "password_reset", "user", user.id)
 
     response = Response({"ok": True})
     return clear_auth_cookie(response)
@@ -460,6 +498,7 @@ def verify_email_view(request):
 
     if not user.email_verified:
         user.mark_email_verified()
+        _record_event(user, "email_verified", "user", user.id)
 
     if settings.EMAIL_VERIFICATION_SUCCESS_URL:
         return redirect(settings.EMAIL_VERIFICATION_SUCCESS_URL)
@@ -508,6 +547,9 @@ def login_view(request):
     if not user.check_password(password):
         return Response({"error": "Email o contraseña incorrectos."}, status=status.HTTP_401_UNAUTHORIZED)
 
+    if not user.is_active or user.disabled_at is not None:
+        return Response({"error": "La cuenta esta deshabilitada."}, status=status.HTTP_403_FORBIDDEN)
+
     if not user.email_verified:
         response = Response(
             {
@@ -517,15 +559,13 @@ def login_view(request):
         )
         return clear_auth_cookie(response)
 
+    user.last_login = timezone.now()
+    user.save(update_fields=["last_login", "updated_at"])
+    _record_event(user, "login")
+
     token = make_auth_token(user)
     response = Response({"user": UserSerializer(user).data, "accessToken": token})
     return set_auth_cookie(response, user, token)
-
-
-@api_view(["POST"])
-def logout_view(request):
-    response = Response({"ok": True})
-    return clear_auth_cookie(response)
 
 
 @api_view(["GET"])
@@ -1206,8 +1246,22 @@ def send_purchase_confirmation_email_once(order):
     if order.purchase_email_sent_at:
         return
 
+    notification = Notification.objects.filter(
+        order=order,
+        type="purchase_confirmed",
+    ).order_by("-created_at").first()
+    if notification and notification.status == "sent":
+        return
+    if not notification:
+        notification = _create_notification(
+            "purchase_confirmed",
+            order.customer_email,
+            user=order.user,
+            order=order,
+        )
+
     try:
-        result = send_purchase_confirmation_email(order)
+        result = send_purchase_confirmation_email(order, notification=notification)
     except EmailDeliveryError as exc:
         logger.warning("Purchase confirmation email failed for order %s: %s", order.id, exc)
         return
@@ -1343,7 +1397,10 @@ def mercado_pago_response_status(status_code, response_body):
 
 def validate_mercado_pago_webhook_signature(request, payment_id):
     if not settings.MP_WEBHOOK_SECRET:
-        return True
+        return bool(
+            settings.DEBUG
+            and getattr(settings, "MP_ALLOW_UNSIGNED_WEBHOOKS_IN_DEBUG", False)
+        )
 
     from mercadopago.webhook import InvalidWebhookSignatureError, WebhookSignatureValidator
 
@@ -2009,6 +2066,13 @@ def library_download_view(request, pk):
             status=status.HTTP_404_NOT_FOUND,
         )
 
+    _record_event(
+        request.user,
+        "material_downloaded",
+        entity_type="product",
+        entity_id=str(pk),
+    )
+
     return Response(
         {
             "downloadUrl": purchase.product.download_url,
@@ -2075,6 +2139,20 @@ def create_payment_preference_view(request):
         except (Product.DoesNotExist, ValueError, KeyError):
             return Response({"error": f"Item inválido: {item}"}, status=status.HTTP_400_BAD_REQUEST)
 
+    base_url = normalize_frontend_url(settings.FRONTEND_URL)
+    backend_url = get_backend_public_url(request)
+    if settings.MP_ACCESS_TOKEN and not settings.DEBUG:
+        if not base_url.startswith("https://"):
+            return Response(
+                {"error": "FRONTEND_URL debe ser HTTPS para Mercado Pago en produccion."},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+        if not backend_url.startswith("https://"):
+            return Response(
+                {"error": "BACKEND_PUBLIC_URL debe ser HTTPS para recibir webhooks de Mercado Pago."},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
     total = sum(item["product"].price * item["quantity"] for item in order_items)
 
     order = Order.objects.create(
@@ -2095,21 +2173,6 @@ def create_payment_preference_view(request):
             quantity=item["quantity"],
             price=item["product"].price,
         )
-
-    base_url = normalize_frontend_url(settings.FRONTEND_URL)
-    backend_url = get_backend_public_url(request)
-
-    if settings.MP_ACCESS_TOKEN and not settings.DEBUG:
-        if not base_url.startswith("https://"):
-            return Response(
-                {"error": "FRONTEND_URL debe ser HTTPS para Mercado Pago en produccion."},
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            )
-        if not backend_url.startswith("https://"):
-            return Response(
-                {"error": "BACKEND_PUBLIC_URL debe ser HTTPS para recibir webhooks de Mercado Pago."},
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            )
 
     if not settings.MP_ACCESS_TOKEN:
         grant_order_access(order)
@@ -2136,6 +2199,8 @@ def create_payment_preference_view(request):
         )
 
     notification_url = get_payment_notification_url(request)
+    _record_event(request.user, "checkout_started", "order", order.id)
+
     preference_payload = {
         "items": [
             {
@@ -2149,9 +2214,9 @@ def create_payment_preference_view(request):
         ],
         "payer": {"name": customer_name, "email": customer_email},
         "back_urls": {
-            "success": f"{base_url}/checkout/success",
-            "failure": f"{base_url}/checkout/failure",
-            "pending": f"{base_url}/checkout/failure",
+            "success": f"{base_url}/checkout/success?order_id={order.id}",
+            "failure": f"{base_url}/checkout/failure?order_id={order.id}",
+            "pending": f"{base_url}/checkout/pending?order_id={order.id}",
         },
         "auto_return": "approved",
         "external_reference": str(order.id),
@@ -2162,29 +2227,19 @@ def create_payment_preference_view(request):
         },
     }
     preference_client = get_mercado_pago_sdk().preference()
-    result = preference_client.create(preference_payload)
+    try:
+        result = preference_client.create(preference_payload)
+    except Exception:
+        logger.exception("Mercado Pago preference creation raised an exception for order %s", order.id)
+        order.status = "fallida"
+        order.save(update_fields=["status", "updated_at"])
+        return Response(
+            {"error": "No se pudo iniciar el pago. Intenta nuevamente."},
+            status=status.HTTP_502_BAD_GATEWAY,
+        )
 
     response_body = result.get("response", {})
     status_code = int(result.get("status") or 500)
-    used_return_urls_fallback = False
-    if status_code >= 400 and is_mercado_pago_back_urls_error(response_body):
-        logger.warning(
-            "Mercado Pago rejected back_urls. Retrying without return URLs. "
-            "status=%s response=%s back_urls=%s notification_url=%s",
-            status_code,
-            response_body,
-            preference_payload.get("back_urls"),
-            notification_url,
-        )
-        fallback_payload = {
-            key: value
-            for key, value in preference_payload.items()
-            if key not in {"back_urls", "auto_return"}
-        }
-        result = preference_client.create(fallback_payload)
-        response_body = result.get("response", {})
-        status_code = int(result.get("status") or 500)
-        used_return_urls_fallback = status_code < 400
 
     if status_code >= 400:
         logger.warning(
@@ -2211,6 +2266,8 @@ def create_payment_preference_view(request):
 
     init_point = get_mercado_pago_checkout_url(response_body, mercado_pago_mode)
     if not init_point:
+        order.status = "fallida"
+        order.save(update_fields=["status", "updated_at"])
         return Response(
             {
                 "error": "Mercado Pago no devolvio un link de pago valido.",
@@ -2219,14 +2276,93 @@ def create_payment_preference_view(request):
             status=status.HTTP_502_BAD_GATEWAY,
         )
 
+    _record_event(request.user, "payment_pending", "order", order.id)
+
     return Response({
         "init_point": init_point,
         "orderId": str(order.id),
         "preferenceId": order.preference_id,
         "notificationUrl": notification_url,
-        "returnUrlsFallback": used_return_urls_fallback,
         "mpMode": mercado_pago_mode,
     })
+
+
+def _create_notification(notification_type, recipient, user=None, order=None, metadata=None):
+    notification = Notification.objects.create(
+        user=user,
+        order=order,
+        type=notification_type,
+        channel="email",
+        recipient=recipient,
+        status="pending",
+        metadata=metadata or {},
+    )
+    if user:
+        _record_event(user, "email_queued", "notification", notification.id)
+    return notification
+
+
+def _deliver_purchase_notification(order, notification):
+    if not notification or notification.status != "pending":
+        return
+    try:
+        result = send_purchase_confirmation_email(order, notification=notification)
+        if result.get("sent"):
+            if not order.purchase_email_sent_at:
+                order.purchase_email_sent_at = timezone.now()
+                order.save(update_fields=["purchase_email_sent_at", "updated_at"])
+    except EmailDeliveryError:
+        return
+
+
+def _webhook_event_identity(request, payment_id):
+    payload = request.data if isinstance(request.data, dict) else {}
+    action = str(payload.get("action") or "payment.updated")[:100]
+    serialized = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+    payload_hash = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+    provider_event_id = str(
+        payload.get("id")
+        or request.headers.get("x-request-id")
+        or f"{payment_id}:{action}:{payload_hash}"
+    )[:200]
+    return provider_event_id, action, payload_hash
+
+
+def _complete_order(order, payment_data):
+    if order.status == "completada":
+        return Notification.objects.filter(
+            order=order,
+            type="purchase_confirmed",
+        ).order_by("-created_at").first()
+
+    now = timezone.now()
+    order.status = "completada"
+    order.payment_id = str(payment_data.get("id") or "")
+    order.paid_at = now
+    order.save(update_fields=["status", "payment_id", "paid_at", "updated_at"])
+
+    for item in order.items.select_related("product"):
+        PurchasedProduct.objects.update_or_create(
+            user=order.user,
+            product=item.product,
+            defaults={"order": order, "is_active": True},
+        )
+
+    _record_event(order.user, "payment_approved", "order", order.id)
+    _record_event(order.user, "library_access_granted", "order", order.id)
+    return _create_notification(
+        "purchase_confirmed",
+        order.customer_email,
+        user=order.user,
+        order=order,
+    )
+
+
+def _finish_payment_event(event, *, processed=True, error_message=""):
+    event.processed = processed
+    event.error_message = str(error_message or "")[:500]
+    event.processed_at = timezone.now() if processed else None
+    event.save(update_fields=["processed", "error_message", "processed_at"])
 
 
 @api_view(["POST"])
@@ -2234,25 +2370,600 @@ def create_payment_preference_view(request):
 def payment_webhook_view(request):
     payment_id = extract_mercado_pago_payment_id(request)
     if not payment_id:
-        return Response({"ok": True, "ignored": "missing_payment_id"})
+        return Response({"error": "Falta data.id."}, status=status.HTTP_400_BAD_REQUEST)
 
     if not validate_mercado_pago_webhook_signature(request, payment_id):
         return Response({"error": "Firma de Mercado Pago invalida."}, status=status.HTTP_401_UNAUTHORIZED)
 
     if not settings.MP_ACCESS_TOKEN:
-        return Response({"ok": True, "ignored": "missing_mp_access_token"})
+        return Response(
+            {"error": "Mercado Pago no esta configurado."},
+            status=status.HTTP_503_SERVICE_UNAVAILABLE,
+        )
 
-    payment, error = get_mercado_pago_payment(payment_id)
+    provider_event_id, action, payload_hash = _webhook_event_identity(request, payment_id)
+    event, created = PaymentEvent.objects.get_or_create(
+        provider="mercadopago",
+        provider_event_id=provider_event_id,
+        defaults={
+            "provider_payment_id": str(payment_id),
+            "event_type": "webhook_received",
+            "action": action,
+            "payload_hash": payload_hash,
+        },
+    )
+    if not created and event.processed:
+        return Response({"ok": True, "duplicate": True})
+
+    payment_data, error = get_mercado_pago_payment(payment_id)
     if error:
-        return Response({"ok": True, "warning": error})
+        _finish_payment_event(event, processed=False, error_message=error)
+        return Response(
+            {"error": "No se pudo consultar el pago."},
+            status=status.HTTP_503_SERVICE_UNAVAILABLE,
+        )
 
-    order = update_order_from_mercado_pago_payment(payment)
+    external_reference = str(payment_data.get("external_reference") or "").strip()
+    if not external_reference:
+        external_reference = str((payment_data.get("metadata") or {}).get("order_id") or "").strip()
+    if not external_reference:
+        _finish_payment_event(event, error_message="missing_external_reference")
+        return Response({"ok": True, "ignored": "missing_external_reference"})
+
+    try:
+        amount = Decimal(str(payment_data["transaction_amount"]))
+        currency = str(payment_data["currency_id"])
+    except (KeyError, TypeError, ValueError):
+        _finish_payment_event(event, error_message="missing_payment_totals")
+        return Response({"ok": True, "ignored": "missing_payment_totals"})
+
+    payment_status = str(payment_data.get("status") or "").lower()
+    notification = None
+
+    try:
+        with transaction.atomic():
+            order = Order.objects.select_for_update().get(id=external_reference)
+
+            if amount != order.total:
+                _finish_payment_event(event, error_message="amount_mismatch")
+                return Response({"ok": True, "ignored": "amount_mismatch"})
+            if currency != "ARS":
+                _finish_payment_event(event, error_message="currency_mismatch")
+                return Response({"ok": True, "ignored": "currency_mismatch"})
+
+            preference_id = str(
+                payment_data.get("preference_id")
+                or (payment_data.get("order") or {}).get("id")
+                or ""
+            )
+            if order.preference_id and preference_id != str(order.preference_id):
+                _finish_payment_event(event, error_message="preference_mismatch")
+                return Response({"ok": True, "ignored": "preference_mismatch"})
+
+            existing_payment = Payment.objects.filter(
+                provider_payment_id=str(payment_id)
+            ).first()
+            if existing_payment and existing_payment.order_id != order.id:
+                _finish_payment_event(event, error_message="payment_already_linked")
+                return Response({"ok": True, "ignored": "payment_already_linked"})
+
+            approved_at = existing_payment.approved_at if existing_payment else None
+            if payment_status == "approved" and approved_at is None:
+                approved_at = timezone.now()
+
+            payment, _ = Payment.objects.update_or_create(
+                provider_payment_id=str(payment_id),
+                defaults={
+                    "order": order,
+                    "provider": "mercadopago",
+                    "preference_id": preference_id,
+                    "status": payment_status,
+                    "status_detail": str(payment_data.get("status_detail") or ""),
+                    "amount": amount,
+                    "currency": currency,
+                    "payer_email": str((payment_data.get("payer") or {}).get("email") or ""),
+                    "approved_at": approved_at,
+                    "raw_metadata": {
+                        "payment_method_id": payment_data.get("payment_method_id"),
+                        "payment_type_id": payment_data.get("payment_type_id"),
+                        "installments": payment_data.get("installments"),
+                    },
+                },
+            )
+
+            if payment_status == "approved":
+                notification = _complete_order(order, payment_data)
+            elif payment_status in {"refunded", "charged_back"}:
+                order.status = "reembolsada"
+                order.payment_id = str(payment_id)
+                order.save(update_fields=["status", "payment_id", "updated_at"])
+                _record_event(order.user, "payment_refunded", "order", order.id)
+            elif order.status == "completada":
+                pass
+            elif payment_status in {"rejected", "cancelled"}:
+                order.status = "fallida"
+                order.payment_id = str(payment_id)
+                order.save(update_fields=["status", "payment_id", "updated_at"])
+                _record_event(order.user, "payment_rejected", "order", order.id)
+            else:
+                order.status = "pendiente"
+                order.payment_id = str(payment_id)
+                order.save(update_fields=["status", "payment_id", "updated_at"])
+                _record_event(order.user, "payment_pending", "order", order.id)
+
+            event.event_type = "payment_processed"
+            event.action = payment_status
+            _finish_payment_event(event)
+    except (Order.DoesNotExist, ValueError):
+        _finish_payment_event(event, error_message="invalid_external_reference")
+        return Response({"ok": True, "ignored": "invalid_external_reference"})
+
+    if payment_status == "approved":
+        _deliver_purchase_notification(order, notification)
+
     return Response({
         "ok": True,
-        "paymentId": str(payment.get("id") or payment_id),
-        "orderId": str(order.id) if order else "",
-        "orderStatus": order.status if order else "",
+        "paymentId": str(payment_id),
+        "orderId": str(order.id),
+        "orderStatus": map_order_status(order.status),
     })
+
+
+@api_view(["PATCH"])
+@permission_classes([IsAuthenticated])
+def change_password_view(request):
+    serializer = ChangePasswordSerializer(data=request.data, context={"request": request})
+    if not serializer.is_valid():
+        return Response({"error": serializer.errors}, status=status.HTTP_400_BAD_REQUEST)
+
+    user = request.user
+    new_password = serializer.validated_data["newPassword"]
+
+    from django.contrib.auth.password_validation import validate_password
+    from django.core.exceptions import ValidationError
+    try:
+        validate_password(new_password, user)
+    except ValidationError as exc:
+        return Response({"error": {"newPassword": exc.messages}}, status=status.HTTP_400_BAD_REQUEST)
+
+    with transaction.atomic():
+        user.set_password(new_password)
+        user.auth_token_version += 1
+        user.save(update_fields=["password", "auth_token_version", "updated_at"])
+
+    _record_event(user, "password_changed")
+
+    response = Response({"ok": True, "message": "Contrasena actualizada. Inicia sesion nuevamente."})
+    return clear_auth_cookie(response)
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def order_status_view(request, pk):
+    order = get_object_or_404(Order.objects.select_related("user"), pk=pk)
+    if order.user_id != request.user.id and not request.user.is_admin:
+        return Response({"error": "No autorizado."}, status=status.HTTP_403_FORBIDDEN)
+
+    has_library_access = PurchasedProduct.objects.filter(
+        order=order, is_active=True
+    ).exists()
+
+    latest_notification = Notification.objects.filter(order=order, type="purchase_confirmed").order_by("-created_at").first()
+    email_status = latest_notification.status if latest_notification else None
+    latest_payment = order.payments.order_by("-updated_at").first()
+    public_status = map_order_status(order.status)
+    redirects = {
+        "approved": "/perfil?payment=approved",
+        "pending": f"/checkout/pending?order_id={order.id}",
+        "rejected": f"/checkout/failure?order_id={order.id}",
+        "refunded": "/perfil?payment=refunded",
+    }
+
+    return Response({
+        "orderId": str(order.id),
+        "status": public_status,
+        "paymentStatus": latest_payment.status if latest_payment else None,
+        "libraryReady": has_library_access,
+        "emailStatus": email_status,
+        "redirectTo": redirects[public_status],
+        "updatedAt": order.updated_at,
+    })
+
+
+@api_view(["PATCH", "DELETE"])
+@permission_classes([IsAuthenticated])
+@parser_classes([MultiPartParser, FormParser])
+def avatar_view(request):
+    if request.method == "DELETE":
+        return _avatar_delete(request)
+    return _avatar_update(request)
+
+
+def _avatar_update(request):
+    user = request.user
+    image = request.FILES.get("avatar")
+    if not image:
+        return Response({"error": "Falta el archivo de avatar."}, status=status.HTTP_400_BAD_REQUEST)
+
+    if not image.content_type.startswith("image/"):
+        return Response({"error": "El archivo debe ser una imagen (JPEG, PNG o WebP)."}, status=status.HTTP_400_BAD_REQUEST)
+
+    allowed_types = {"image/jpeg", "image/png", "image/webp"}
+    if image.content_type not in allowed_types:
+        return Response({"error": "Formato no soportado. Usa JPEG, PNG o WebP."}, status=status.HTTP_400_BAD_REQUEST)
+
+    max_bytes = getattr(settings, "CLOUDINARY_AVATAR_MAX_BYTES", 5 * 1024 * 1024)
+    if image.size > max_bytes:
+        return Response({"error": f"La imagen supera el maximo de {max_bytes // (1024*1024)} MB."}, status=status.HTTP_400_BAD_REQUEST)
+
+    from PIL import Image as PilImage
+    try:
+        pil_image = PilImage.open(image)
+        pil_image.verify()
+        image.seek(0)
+    except Exception:
+        return Response({"error": "El contenido del archivo no es una imagen valida."}, status=status.HTTP_400_BAD_REQUEST)
+
+    credentials = get_cloudinary_credentials()
+    if not credentials:
+        return Response(
+            {"error": "Configura Cloudinary en Ajustes antes de subir imagenes."},
+            status=status.HTTP_409_CONFLICT,
+        )
+
+    profile, _ = UserProfile.objects.get_or_create(user=user)
+    old_public_id = profile.avatar_public_id
+
+    avatar_folder = f"{settings.CLOUDINARY_AVATAR_FOLDER.rstrip('/')}/{user.id}"
+    timestamp = int(time.time())
+    upload_params = {
+        "timestamp": timestamp,
+        "folder": avatar_folder,
+    }
+    signature = sign_cloudinary_upload(upload_params, credentials["api_secret"])
+    upload_url = f"https://api.cloudinary.com/v1_1/{credentials['cloud_name']}/image/upload"
+
+    try:
+        response = requests.post(
+            upload_url,
+            data={
+                **{key: value for key, value in upload_params.items() if value},
+                "api_key": credentials["api_key"],
+                "signature": signature,
+            },
+            files={"file": (image.name, image.file, image.content_type)},
+            timeout=30,
+        )
+    except requests.RequestException as exc:
+        logger.error("Cloudinary avatar upload failed: %s", exc, exc_info=True)
+        return Response({"error": "No se pudo subir el avatar."}, status=status.HTTP_502_BAD_GATEWAY)
+
+    if response.status_code >= 400:
+        message = cloudinary_error(response, "Cloudinary rechazo la imagen.")
+        logger.error("Cloudinary avatar upload rejected: %s", message)
+        return Response({"error": message}, status=status.HTTP_502_BAD_GATEWAY)
+
+    try:
+        data = response.json()
+    except ValueError:
+        return Response({"error": "Cloudinary devolvio una respuesta invalida."}, status=status.HTTP_502_BAD_GATEWAY)
+
+    secure_url = data.get("secure_url")
+    if not secure_url:
+        return Response({"error": "Cloudinary no devolvio una URL valida."}, status=status.HTTP_502_BAD_GATEWAY)
+
+    profile.avatar_url = secure_url
+    profile.avatar_public_id = data.get("public_id", "")
+    profile.save(update_fields=["avatar_url", "avatar_public_id", "updated_at"])
+
+    if old_public_id:
+        _cloudinary_delete_image(old_public_id)
+
+    _record_event(user, "avatar_updated")
+
+    return Response({
+        "avatarUrl": secure_url,
+    })
+
+
+def _avatar_delete(request):
+    user = request.user
+    profile = getattr(user, "profile", None)
+    if not profile or not profile.avatar_public_id:
+        return Response({"ok": True, "deleted": False, "message": "No hay avatar para eliminar."})
+
+    public_id = profile.avatar_public_id
+    if not _cloudinary_delete_image(public_id):
+        return Response(
+            {"error": "No se pudo eliminar el avatar de Cloudinary."},
+            status=status.HTTP_502_BAD_GATEWAY,
+        )
+
+    profile.avatar_url = ""
+    profile.avatar_public_id = ""
+    profile.save(update_fields=["avatar_url", "avatar_public_id", "updated_at"])
+
+    _record_event(user, "avatar_deleted")
+
+    return Response({"ok": True, "deleted": True})
+
+
+# --- Admin: Users ---
+
+
+def _admin_user_data(user):
+    profile = getattr(user, "profile", None)
+    orders_count = getattr(user, "metric_orders_count", None)
+    completed_orders_count = getattr(user, "metric_completed_orders_count", None)
+    total_spent = getattr(user, "metric_total_spent", None)
+    last_order_at = getattr(user, "metric_last_order_at", None)
+    library_count = getattr(user, "metric_library_count", None)
+    emails_sent = getattr(user, "metric_emails_sent", None)
+    emails_failed = getattr(user, "metric_emails_failed", None)
+
+    if orders_count is None:
+        orders_count = user.orders.count()
+        completed_orders = user.orders.filter(status="completada")
+        completed_orders_count = completed_orders.count()
+        total_spent = completed_orders.aggregate(total=Sum("total"))["total"] or Decimal("0")
+        last_order = user.orders.order_by("-created_at").first()
+        last_order_at = last_order.created_at if last_order else None
+        library_count = PurchasedProduct.objects.filter(user=user, is_active=True).count()
+        emails_sent = Notification.objects.filter(user=user, status="sent").count()
+        emails_failed = Notification.objects.filter(user=user, status="failed").count()
+
+    return {
+        "id": str(user.id),
+        "name": user.first_name or user.email.split("@")[0],
+        "email": user.email,
+        "avatarUrl": profile.avatar_url if profile else "",
+        "emailVerified": user.email_verified,
+        "isActive": user.is_active,
+        "createdAt": user.created_at,
+        "lastLoginAt": user.last_login,
+        "ordersCount": orders_count,
+        "completedOrdersCount": completed_orders_count,
+        "totalSpent": str(total_spent),
+        "lastOrderAt": last_order_at,
+        "libraryItemsCount": library_count,
+        "emailsSentCount": emails_sent,
+        "emailsFailedCount": emails_failed,
+    }
+
+
+@api_view(["GET"])
+@permission_classes([IsEnvAdmin])
+def admin_users_list_view(request):
+    try:
+        page = max(1, int(request.query_params.get("page", "1")))
+        page_size = min(100, max(1, int(request.query_params.get("pageSize", "20"))))
+    except (TypeError, ValueError):
+        return Response(
+            {"error": "page y pageSize deben ser numeros enteros positivos."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    search = request.query_params.get("search", "").strip()
+    email_verified = request.query_params.get("emailVerified", "").strip()
+    status_filter = request.query_params.get("status", "").strip()
+    has_purchases = request.query_params.get("hasPurchases", "").strip()
+    ordering = request.query_params.get("ordering", "-created_at").strip()
+
+    order_metrics = Order.objects.filter(user_id=OuterRef("pk")).values("user_id")
+    completed_metrics = order_metrics.filter(status="completada")
+    purchase_metrics = PurchasedProduct.objects.filter(
+        user_id=OuterRef("pk"), is_active=True
+    ).values("user_id")
+    sent_metrics = Notification.objects.filter(
+        user_id=OuterRef("pk"), status="sent"
+    ).values("user_id")
+    failed_metrics = Notification.objects.filter(
+        user_id=OuterRef("pk"), status="failed"
+    ).values("user_id")
+
+    queryset = User.objects.select_related("profile").annotate(
+        metric_orders_count=Coalesce(
+            Subquery(order_metrics.annotate(value=Count("id")).values("value")[:1]),
+            Value(0),
+            output_field=IntegerField(),
+        ),
+        metric_completed_orders_count=Coalesce(
+            Subquery(completed_metrics.annotate(value=Count("id")).values("value")[:1]),
+            Value(0),
+            output_field=IntegerField(),
+        ),
+        metric_total_spent=Coalesce(
+            Subquery(
+                completed_metrics.annotate(value=Sum("total")).values("value")[:1],
+                output_field=DecimalField(max_digits=12, decimal_places=2),
+            ),
+            Value(Decimal("0.00")),
+            output_field=DecimalField(max_digits=12, decimal_places=2),
+        ),
+        metric_last_order_at=Subquery(
+            Order.objects.filter(user_id=OuterRef("pk"))
+            .order_by("-created_at")
+            .values("created_at")[:1]
+        ),
+        metric_library_count=Coalesce(
+            Subquery(purchase_metrics.annotate(value=Count("id")).values("value")[:1]),
+            Value(0),
+            output_field=IntegerField(),
+        ),
+        metric_emails_sent=Coalesce(
+            Subquery(sent_metrics.annotate(value=Count("id")).values("value")[:1]),
+            Value(0),
+            output_field=IntegerField(),
+        ),
+        metric_emails_failed=Coalesce(
+            Subquery(failed_metrics.annotate(value=Count("id")).values("value")[:1]),
+            Value(0),
+            output_field=IntegerField(),
+        ),
+    )
+
+    if search:
+        queryset = queryset.filter(
+            Q(email__icontains=search) | Q(first_name__icontains=search)
+        )
+    if email_verified == "true":
+        queryset = queryset.filter(email_verified=True)
+    elif email_verified == "false":
+        queryset = queryset.filter(email_verified=False)
+    if status_filter == "active":
+        queryset = queryset.filter(is_active=True)
+    elif status_filter == "disabled":
+        queryset = queryset.filter(is_active=False)
+    if has_purchases == "true":
+        queryset = queryset.filter(purchased_products__is_active=True).distinct()
+    elif has_purchases == "false":
+        queryset = queryset.exclude(purchased_products__is_active=True).distinct()
+
+    valid_ordering = {"created_at", "-created_at", "email", "-email", "last_login", "-last_login"}
+    if ordering not in valid_ordering:
+        ordering = "-created_at"
+    queryset = queryset.order_by(ordering)
+
+    total_items = queryset.count()
+    total_pages = max(1, (total_items + page_size - 1) // page_size)
+    page = min(page, total_pages)
+
+    start = (page - 1) * page_size
+    end = start + page_size
+    users_page = queryset[start:end]
+
+    return Response({
+        "items": [_admin_user_data(u) for u in users_page],
+        "pagination": {
+            "page": page,
+            "pageSize": page_size,
+            "totalItems": total_items,
+            "totalPages": total_pages,
+        },
+    })
+
+
+@api_view(["GET"])
+@permission_classes([IsEnvAdmin])
+def admin_user_detail_view(request, pk):
+    user = get_object_or_404(User, pk=pk)
+    profile = getattr(user, "profile", None)
+    recent_orders = user.orders.order_by("-created_at")[:10]
+    payments = Payment.objects.filter(order__user=user).order_by("-created_at")[:10]
+    library = PurchasedProduct.objects.filter(user=user, is_active=True).select_related("product", "order")[:20]
+    notifications = Notification.objects.filter(user=user).order_by("-created_at")[:20]
+    events = UserEvent.objects.filter(user=user)[:50]
+
+    return Response({
+        "user": _admin_user_data(user),
+        "profile": {
+            "avatarUrl": profile.avatar_url if profile else "",
+            "phone": profile.phone if profile else "",
+        } if profile else None,
+        "recentOrders": [
+            {
+                "id": str(o.id),
+                "total": str(o.total),
+                "status": o.status,
+                "createdAt": o.created_at,
+            }
+            for o in recent_orders
+        ],
+        "payments": [
+            {
+                "id": str(p.id),
+                "providerPaymentId": p.provider_payment_id,
+                "status": p.status,
+                "amount": str(p.amount),
+                "createdAt": p.created_at,
+            }
+            for p in payments
+        ],
+        "library": [
+            {
+                "id": str(pp.id),
+                "productTitle": pp.product.title,
+                "productId": str(pp.product.id),
+                "acquiredAt": pp.acquired_at,
+            }
+            for pp in library
+        ],
+        "notifications": NotificationSerializer(notifications, many=True).data,
+        "events": UserEventSerializer(events, many=True).data,
+    })
+
+
+@api_view(["GET"])
+@permission_classes([IsEnvAdmin])
+def admin_user_orders_view(request, pk):
+    user = get_object_or_404(User, pk=pk)
+    orders = user.orders.order_by("-created_at")
+    return Response({
+        "items": OrderSerializer(orders, many=True).data,
+    })
+
+
+@api_view(["GET"])
+@permission_classes([IsEnvAdmin])
+def admin_user_events_view(request, pk):
+    user = get_object_or_404(User, pk=pk)
+    events = UserEvent.objects.filter(user=user)
+    return Response({
+        "items": UserEventSerializer(events, many=True).data,
+    })
+
+
+@api_view(["GET"])
+@permission_classes([IsEnvAdmin])
+def admin_user_notifications_view(request, pk):
+    user = get_object_or_404(User, pk=pk)
+    notifications = Notification.objects.filter(user=user).order_by("-created_at")
+    return Response({
+        "items": NotificationSerializer(notifications, many=True).data,
+    })
+
+
+@api_view(["GET"])
+@permission_classes([IsEnvAdmin])
+def admin_user_library_view(request, pk):
+    user = get_object_or_404(User, pk=pk)
+    library = PurchasedProduct.objects.filter(user=user, is_active=True).select_related("product", "order")
+    return Response({
+        "items": PurchasedProductSerializer(library, many=True).data,
+    })
+
+
+@api_view(["POST"])
+@permission_classes([IsEnvAdmin])
+def admin_order_resend_email_view(request, pk):
+    order = get_object_or_404(Order, pk=pk)
+    if order.status != "completada":
+        return Response({"error": "La orden no esta completada."}, status=status.HTTP_400_BAD_REQUEST)
+
+    notification = _create_notification(
+        notification_type="purchase_confirmed",
+        recipient=order.customer_email,
+        user=order.user,
+        order=order,
+    )
+
+    try:
+        result = send_purchase_confirmation_email(order, notification=notification)
+        if result.get("sent"):
+            if not order.purchase_email_sent_at:
+                order.purchase_email_sent_at = timezone.now()
+                order.save(update_fields=["purchase_email_sent_at", "updated_at"])
+            return Response({"ok": True, "sent": True})
+        return Response({"ok": True, "sent": False, "reason": result.get("reason", "")})
+    except EmailDeliveryError as exc:
+        return Response({"ok": False, "sent": False, "error": str(exc)}, status=status.HTTP_502_BAD_GATEWAY)
+
+
+@api_view(["POST"])
+def logout_view(request):
+    if request.user.is_authenticated:
+        _record_event(request.user, "logout")
+    response = Response({"ok": True})
+    return clear_auth_cookie(response)
 
 
 # --- Import Bundle ---

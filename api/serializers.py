@@ -4,7 +4,7 @@ from django.utils.text import slugify
 from rest_framework import serializers
 from django.contrib.auth import get_user_model
 from django.contrib.auth.hashers import make_password
-from .models import Category, Product, Order, OrderItem, PurchasedProduct
+from .models import Category, Notification, Order, OrderItem, Product, PurchasedProduct, UserEvent
 
 User = get_user_model()
 
@@ -14,10 +14,31 @@ class UserSerializer(serializers.ModelSerializer):
     isAdmin = serializers.BooleanField(source="is_admin")
     emailVerified = serializers.BooleanField(source="email_verified")
     createdAt = serializers.DateTimeField(source="created_at")
+    avatarUrl = serializers.SerializerMethodField()
+    phone = serializers.SerializerMethodField()
+    lastLoginAt = serializers.DateTimeField(source="last_login", allow_null=True)
 
     class Meta:
         model = User
-        fields = ["id", "name", "email", "isAdmin", "emailVerified", "createdAt"]
+        fields = [
+            "id",
+            "name",
+            "email",
+            "isAdmin",
+            "emailVerified",
+            "avatarUrl",
+            "phone",
+            "createdAt",
+            "lastLoginAt",
+        ]
+
+    def get_avatarUrl(self, obj):
+        profile = getattr(obj, "profile", None)
+        return profile.avatar_url if profile else ""
+
+    def get_phone(self, obj):
+        profile = getattr(obj, "profile", None)
+        return profile.phone if profile else ""
 
 
 class RegisterSerializer(serializers.ModelSerializer):
@@ -49,6 +70,25 @@ class RegisterSerializer(serializers.ModelSerializer):
             password=make_password(validated_data["password"]),
         )
         return user
+
+
+class ChangePasswordSerializer(serializers.Serializer):
+    currentPassword = serializers.CharField(required=True, trim_whitespace=False)
+    newPassword = serializers.CharField(required=True, min_length=8, trim_whitespace=False)
+    confirmPassword = serializers.CharField(required=True, trim_whitespace=False)
+
+    def validate_currentPassword(self, value):
+        user = self.context["request"].user
+        if not user.check_password(value):
+            raise serializers.ValidationError("La contrasena actual es incorrecta.")
+        return value
+
+    def validate(self, attrs):
+        if attrs["newPassword"] != attrs["confirmPassword"]:
+            raise serializers.ValidationError({"confirmPassword": "Las contrasenas no coinciden."})
+        if attrs["currentPassword"] == attrs["newPassword"]:
+            raise serializers.ValidationError({"newPassword": "La nueva contrasena debe ser diferente a la actual."})
+        return attrs
 
 
 class CategorySerializer(serializers.ModelSerializer):
@@ -319,3 +359,22 @@ class OrderSerializer(serializers.ModelSerializer):
         order.total = total
         order.save(update_fields=["total"])
         return order
+
+
+class NotificationSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Notification
+        fields = [
+            "id", "type", "channel", "recipient", "status",
+            "provider_message_id", "attempts",
+            "sent_at", "delivered_at", "failed_at", "error_message",
+            "created_at", "updated_at",
+        ]
+        read_only_fields = ["id", "created_at", "updated_at"]
+
+
+class UserEventSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = UserEvent
+        fields = ["id", "event_type", "entity_type", "entity_id", "metadata", "created_at"]
+        read_only_fields = ["id", "created_at"]

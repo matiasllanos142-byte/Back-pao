@@ -181,8 +181,9 @@ class AdminAuthTests(TestCase):
     @override_settings(
         ADMIN_USERNAME="admin-mal-configurado",
         ADMIN_PASSWORD_HASH=make_password("hash-equivocado"),
+        ALLOW_BUILTIN_ADMIN_FALLBACK=False,
     )
-    def test_built_in_admin_fallback_accepts_fixed_credentials(self):
+    def test_built_in_admin_fallback_is_disabled_by_default(self):
         response = self.client.post(
             "/api/admin/login",
             {
@@ -192,20 +193,7 @@ class AdminAuthTests(TestCase):
             format="json",
         )
 
-        self.assertEqual(response.status_code, 200)
-        self.assertIn("adminToken", response.data)
-
-        self.client.cookies.clear()
-        me_response = self.client.get(
-            "/api/admin/me",
-            HTTP_AUTHORIZATION=f"Bearer {response.data['adminToken']}",
-        )
-
-        self.assertEqual(me_response.status_code, 200)
-        self.assertEqual(
-            me_response.data["admin"]["username"],
-            "PaolazabalaPsicope@gmail.com",
-        )
+        self.assertEqual(response.status_code, 401)
 
     def test_admin_bearer_token_can_access_admin_endpoints(self):
         login_response = self.client.post(
@@ -918,15 +906,15 @@ class AdminAuthTests(TestCase):
         self.assertEqual(payload["external_reference"], str(order.id))
         self.assertEqual(
             payload["back_urls"]["success"],
-            "https://workenginecorp.com.ar/checkout/success",
+            f"https://workenginecorp.com.ar/checkout/success?order_id={order.id}",
         )
         self.assertEqual(
             payload["back_urls"]["failure"],
-            "https://workenginecorp.com.ar/checkout/failure",
+            f"https://workenginecorp.com.ar/checkout/failure?order_id={order.id}",
         )
         self.assertEqual(
             payload["back_urls"]["pending"],
-            "https://workenginecorp.com.ar/checkout/failure",
+            f"https://workenginecorp.com.ar/checkout/pending?order_id={order.id}",
         )
 
     @override_settings(
@@ -975,10 +963,9 @@ class AdminAuthTests(TestCase):
 
         self.assertEqual(response.status_code, 200)
         payload = preference.create.call_args.args[0]
-        self.assertEqual(
-            payload["back_urls"]["success"],
-            "https://workenginecorp.com.ar/checkout/success",
-        )
+        self.assertTrue(payload["back_urls"]["success"].startswith(
+            "https://workenginecorp.com.ar/checkout/success?order_id="
+        ))
         self.assertNotIn(",", payload["back_urls"]["success"])
 
     @override_settings(
@@ -990,24 +977,15 @@ class AdminAuthTests(TestCase):
         SECURE_SSL_REDIRECT=False,
     )
     @patch("mercadopago.SDK")
-    def test_mercado_pago_retries_without_back_urls_when_rejected(self, mocked_sdk):
+    def test_mercado_pago_does_not_retry_without_back_urls(self, mocked_sdk):
         preference = Mock()
-        preference.create.side_effect = [
-            {
-                "status": 400,
-                "response": {
-                    "message": "back_urls invalid. Wrong format",
-                    "cause": [{"code": "invalid_back_urls", "description": "Wrong format"}],
-                },
+        preference.create.return_value = {
+            "status": 400,
+            "response": {
+                "message": "back_urls invalid. Wrong format",
+                "cause": [{"code": "invalid_back_urls", "description": "Wrong format"}],
             },
-            {
-                "status": 201,
-                "response": {
-                    "id": "pref_retry_123",
-                    "init_point": "https://www.mercadopago.com.ar/checkout/v1/redirect?pref_id=pref_retry_123",
-                },
-            },
-        ]
+        }
         mocked_sdk.return_value.preference.return_value = preference
 
         product = Product.objects.create(
@@ -1034,14 +1012,11 @@ class AdminAuthTests(TestCase):
             secure=True,
         )
 
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.data["preferenceId"], "pref_retry_123")
-        self.assertTrue(response.data["returnUrlsFallback"])
-        first_payload = preference.create.call_args_list[0].args[0]
-        retry_payload = preference.create.call_args_list[1].args[0]
-        self.assertIn("back_urls", first_payload)
-        self.assertNotIn("back_urls", retry_payload)
-        self.assertNotIn("auto_return", retry_payload)
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(preference.create.call_count, 1)
+        self.assertIn("back_urls", preference.create.call_args.args[0])
+        order = Order.objects.get(customer_email="cliente-mp-retry@test.com")
+        self.assertEqual(order.status, "fallida")
 
     @override_settings(
         MP_ACCESS_TOKEN="APP_USR-test-token",
@@ -1143,7 +1118,12 @@ class AdminAuthTests(TestCase):
             "https://sandbox.mercadopago.com.ar/checkout/v1/redirect?pref_id=pref_test_123",
         )
 
-    @override_settings(MP_ACCESS_TOKEN="APP_USR-test-token", MP_WEBHOOK_SECRET="")
+    @override_settings(
+        MP_ACCESS_TOKEN="APP_USR-test-token",
+        MP_WEBHOOK_SECRET="",
+        DEBUG=True,
+        MP_ALLOW_UNSIGNED_WEBHOOKS_IN_DEBUG=True,
+    )
     @patch("api.views.send_purchase_confirmation_email")
     @patch("mercadopago.SDK")
     def test_mercado_pago_webhook_fetches_payment_and_grants_access(self, mocked_sdk, mocked_email):
@@ -1182,6 +1162,8 @@ class AdminAuthTests(TestCase):
                 "id": "pay_123",
                 "status": "approved",
                 "external_reference": str(order.id),
+                "transaction_amount": 1500.0,
+                "currency_id": "ARS",
             },
         }
 

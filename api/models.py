@@ -10,6 +10,8 @@ class User(AbstractUser):
     is_admin = models.BooleanField(default=False)
     email_verified = models.BooleanField(default=False)
     email_verified_at = models.DateTimeField(blank=True, null=True)
+    auth_token_version = models.IntegerField(default=0)
+    disabled_at = models.DateTimeField(blank=True, null=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -26,6 +28,164 @@ class User(AbstractUser):
         self.email_verified = True
         self.email_verified_at = timezone.now()
         self.save(update_fields=["email_verified", "email_verified_at", "updated_at"])
+
+    def increment_token_version(self):
+        self.auth_token_version += 1
+        self.save(update_fields=["auth_token_version", "updated_at"])
+
+
+class UserProfile(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    user = models.OneToOneField(User, on_delete=models.CASCADE, related_name="profile")
+    avatar_url = models.CharField(max_length=500, blank=True)
+    avatar_public_id = models.CharField(max_length=500, blank=True)
+    phone = models.CharField(max_length=50, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "user_profiles"
+
+    def __str__(self):
+        return f"Profile for {self.user.email}"
+
+
+class Payment(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    order = models.ForeignKey("Order", on_delete=models.CASCADE, related_name="payments")
+    provider = models.CharField(max_length=50, default="mercadopago")
+    provider_payment_id = models.CharField(max_length=200, unique=True)
+    preference_id = models.CharField(max_length=200, blank=True)
+    status = models.CharField(max_length=50)
+    status_detail = models.CharField(max_length=200, blank=True)
+    amount = models.DecimalField(max_digits=10, decimal_places=2)
+    currency = models.CharField(max_length=10, default="ARS")
+    payer_email = models.EmailField(blank=True)
+    approved_at = models.DateTimeField(blank=True, null=True)
+    raw_metadata = models.JSONField(default=dict, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "payments"
+        verbose_name_plural = "payments"
+        indexes = [
+            models.Index(fields=["provider_payment_id"]),
+            models.Index(fields=["order", "status"]),
+        ]
+
+    def __str__(self):
+        return f"Payment {self.provider_payment_id} - {self.status}"
+
+
+class PaymentEvent(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    provider = models.CharField(max_length=50, default="mercadopago")
+    provider_event_id = models.CharField(max_length=200, blank=True)
+    provider_payment_id = models.CharField(max_length=200, blank=True)
+    event_type = models.CharField(max_length=100)
+    action = models.CharField(max_length=100, blank=True)
+    payload_hash = models.CharField(max_length=64, blank=True)
+    processed = models.BooleanField(default=False)
+    error_message = models.TextField(blank=True)
+    received_at = models.DateTimeField(auto_now_add=True)
+    processed_at = models.DateTimeField(blank=True, null=True)
+
+    class Meta:
+        db_table = "payment_events"
+        constraints = [
+            models.UniqueConstraint(
+                fields=["provider", "provider_event_id"],
+                condition=~models.Q(provider_event_id=""),
+                name="unique_provider_payment_event",
+            )
+        ]
+        indexes = [
+            models.Index(fields=["provider_payment_id", "event_type"]),
+            models.Index(fields=["payload_hash"]),
+        ]
+
+    def __str__(self):
+        return f"{self.event_type} - {self.provider_payment_id}"
+
+
+class Notification(models.Model):
+    STATUS_CHOICES = [
+        ("pending", "Pending"),
+        ("sent", "Sent"),
+        ("failed", "Failed"),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    user = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, related_name="notifications")
+    order = models.ForeignKey("Order", on_delete=models.SET_NULL, null=True, blank=True, related_name="notifications")
+    type = models.CharField(max_length=100)
+    channel = models.CharField(max_length=50, default="email")
+    recipient = models.EmailField()
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="pending")
+    provider_message_id = models.CharField(max_length=300, blank=True)
+    attempts = models.PositiveSmallIntegerField(default=0)
+    sent_at = models.DateTimeField(blank=True, null=True)
+    delivered_at = models.DateTimeField(blank=True, null=True)
+    failed_at = models.DateTimeField(blank=True, null=True)
+    error_message = models.TextField(blank=True)
+    metadata = models.JSONField(default=dict, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "notifications"
+        indexes = [
+            models.Index(fields=["user", "type"]),
+            models.Index(fields=["order", "type"]),
+            models.Index(fields=["status"]),
+        ]
+
+    def __str__(self):
+        return f"{self.type} -> {self.recipient} [{self.status}]"
+
+
+class UserEvent(models.Model):
+    EVENT_TYPES = [
+        ("account_registered", "Account Registered"),
+        ("email_verified", "Email Verified"),
+        ("login", "Login"),
+        ("logout", "Logout"),
+        ("password_changed", "Password Changed"),
+        ("password_reset", "Password Reset"),
+        ("avatar_updated", "Avatar Updated"),
+        ("avatar_deleted", "Avatar Deleted"),
+        ("checkout_started", "Checkout Started"),
+        ("payment_pending", "Payment Pending"),
+        ("payment_approved", "Payment Approved"),
+        ("payment_rejected", "Payment Rejected"),
+        ("payment_refunded", "Payment Refunded"),
+        ("library_access_granted", "Library Access Granted"),
+        ("material_downloaded", "Material Downloaded"),
+        ("email_queued", "Email Queued"),
+        ("email_sent", "Email Sent"),
+        ("email_failed", "Email Failed"),
+        ("profile_updated", "Profile Updated"),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    user = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, related_name="events")
+    event_type = models.CharField(max_length=50, choices=EVENT_TYPES)
+    entity_type = models.CharField(max_length=50, blank=True)
+    entity_id = models.CharField(max_length=200, blank=True)
+    metadata = models.JSONField(default=dict, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "user_events"
+        indexes = [
+            models.Index(fields=["user", "event_type"]),
+            models.Index(fields=["event_type", "created_at"]),
+        ]
+        ordering = ["-created_at"]
+
+    def __str__(self):
+        return f"{self.event_type} - {self.user_id}"
 
 
 class PendingRegistration(models.Model):
@@ -217,6 +377,7 @@ class PurchasedProduct(models.Model):
         constraints = [
             models.UniqueConstraint(
                 fields=["user", "product"],
+                condition=models.Q(is_active=True),
                 name="unique_active_product_access_per_user",
             )
         ]
@@ -244,6 +405,7 @@ class Order(models.Model):
     preference_id = models.CharField(max_length=200, blank=True, null=True)
     payment_id = models.CharField(max_length=200, blank=True, null=True)
     external_reference = models.CharField(max_length=200, blank=True, null=True)
+    paid_at = models.DateTimeField(blank=True, null=True)
     purchase_email_sent_at = models.DateTimeField(blank=True, null=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
