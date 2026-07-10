@@ -140,6 +140,17 @@ MP_ALLOW_UNSIGNED_WEBHOOKS_IN_DEBUG = (
 FRONTEND_URL = public_frontend_url(os.environ.get("FRONTEND_URL", "http://localhost:3000"))
 EMAIL_ASSETS_BASE_URL = os.environ.get("EMAIL_ASSETS_BASE_URL", "").rstrip("/")
 
+GITHUB_OWNER = os.environ.get("GITHUB_OWNER", "negro123454332-jpg").strip()
+GITHUB_REPO = os.environ.get("GITHUB_REPO", "app-pao").strip()
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "").strip()
+GITHUB_APK_ASSET_NAME = os.environ.get("GITHUB_APK_ASSET_NAME", "paola-psicope.apk").strip()
+GITHUB_SHA256_ASSET_NAME = os.environ.get(
+    "GITHUB_SHA256_ASSET_NAME", "paola-psicope.apk.sha256"
+).strip()
+GITHUB_RELEASE_CACHE_TTL_SECONDS = int(os.environ.get("GITHUB_RELEASE_CACHE_TTL_SECONDS", "300"))
+GITHUB_CONNECT_TIMEOUT_SECONDS = int(os.environ.get("GITHUB_CONNECT_TIMEOUT_SECONDS", "5"))
+GITHUB_READ_TIMEOUT_SECONDS = int(os.environ.get("GITHUB_READ_TIMEOUT_SECONDS", "30"))
+
 INSTALLED_APPS = [
     "django.contrib.admin",
     "django.contrib.auth",

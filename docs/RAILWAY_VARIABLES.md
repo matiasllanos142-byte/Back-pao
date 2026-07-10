@@ -96,3 +96,18 @@ ANDROID_API_BASE_URL=https://backend.example.com/api/
 ```
 
 No exponer en web ni Android ninguna credencial de Mercado Pago, PostgreSQL, Resend, Cloudinary o administración.
+
+## Distribución de la aplicación Android
+
+| Variable | Obligatoria | Ejemplo | Uso |
+|---|---:|---|---|
+| `GITHUB_OWNER` | Sí | `negro123454332-jpg` | Propietario fijo del repositorio Android. |
+| `GITHUB_REPO` | Sí | `app-pao` | Repositorio fijo con Releases. |
+| `GITHUB_TOKEN` | Solo repositorio privado | `<fine-grained-pat>` | Token exclusivo de backend con permiso Contents: read. |
+| `GITHUB_APK_ASSET_NAME` | Sí | `paola-psicope.apk` | Nombre exacto del asset APK. |
+| `GITHUB_SHA256_ASSET_NAME` | No | `paola-psicope.apk.sha256` | Checksum opcional. |
+| `GITHUB_RELEASE_CACHE_TTL_SECONDS` | No | `300` | Caché de metadata por instancia. |
+| `GITHUB_CONNECT_TIMEOUT_SECONDS` | No | `5` | Timeout de conexión. |
+| `GITHUB_READ_TIMEOUT_SECONDS` | No | `30` | Timeout de lectura remota. |
+
+El token nunca se entrega a web o Android.

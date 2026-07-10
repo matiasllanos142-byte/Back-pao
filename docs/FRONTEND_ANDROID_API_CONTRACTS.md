@@ -189,3 +189,48 @@ interface PaolaApi {
 ```
 
 El interceptor Android agrega `Authorization: Bearer` y, tras cambiar contraseña, elimina el token local.
+
+## Distribución de APK
+
+### GET `/app/android/latest`
+
+Público. Devuelve metadata segura de la última Release estable:
+
+```json
+{
+  "platform": "android",
+  "available": true,
+  "version": "1.2.3",
+  "tag": "v1.2.3",
+  "name": "Paola Psicopé 1.2.3",
+  "publishedAt": "ISO-8601",
+  "fileName": "paola-psicope.apk",
+  "size": 12345678,
+  "sizeFormatted": "11.8 MB",
+  "sha256": null,
+  "downloadUrl": "/api/app/android/download"
+}
+```
+
+No devuelve URLs de GitHub ni tokens.
+
+### GET `/app/android/download`
+
+Descarga pública transmitida por streaming desde el backend:
+
+```text
+Content-Type: application/vnd.android.package-archive
+Content-Disposition: attachment; filename="paola-psicope.apk"
+```
+
+Errores:
+
+- `404 ANDROID_RELEASE_NOT_FOUND`: todavía no existe Release o APK.
+- `502 GITHUB_RELEASE_UNAVAILABLE`: GitHub no respondió correctamente.
+
+URL productiva esperada:
+
+```text
+https://heroic-exploration-production.up.railway.app/api/app/android/latest
+https://heroic-exploration-production.up.railway.app/api/app/android/download
+```

@@ -1,7 +1,10 @@
 from django.urls import path
 from . import views
+from . import android_releases
 
 urlpatterns = [
+    path("app/android/latest", android_releases.android_latest_view, name="android-latest"),
+    path("app/android/download", android_releases.android_download_view, name="android-download"),
     path("admin/login", views.admin_login_view, name="admin-login"),
     path("admin/logout", views.admin_logout_view, name="admin-logout"),
     path("admin/me", views.admin_me_view, name="admin-me"),
