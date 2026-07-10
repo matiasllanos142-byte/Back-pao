@@ -62,6 +62,7 @@ from .serializers import (
 from .permissions import IsAdmin
 from .permissions import IsEnvAdmin
 from .admin_auth import (
+    _canonical_admin_username,
     clear_admin_cookie,
     create_admin_token,
     get_admin_from_request,
@@ -575,22 +576,59 @@ def me_view(request):
     return Response({"user": None})
 
 
+def _build_admin_response(username):
+    """Build structured admin data dict from a canonical username/email."""
+    if not username:
+        return None
+    try:
+        user = User.objects.get(email__iexact=username, is_admin=True)
+        return {
+            "id": str(user.id),
+            "username": user.email,
+            "name": user.first_name or user.email.split("@")[0],
+            "email": user.email,
+            "role": "admin",
+        }
+    except User.DoesNotExist:
+        return {
+            "id": None,
+            "username": username,
+            "name": username.split("@")[0] if "@" in username else username,
+            "email": username,
+            "role": "admin",
+        }
+
+
 @api_view(["POST"])
 @permission_classes([AllowAny])
 def admin_login_view(request):
-    username = request.data.get("username", "").strip()
+    username = request.data.get("username") or ""
     password = request.data.get("password", "")
+
+    if not username or not password:
+        return Response(
+            {"error": "ADMIN_UNAUTHORIZED", "message": "Usuario y contrasena son obligatorios.", "details": None},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
 
     if not verify_admin_credentials(username, password):
         return Response(
-            {"error": "Credenciales de administracion incorrectas."},
+            {"error": "ADMIN_UNAUTHORIZED", "message": "Credenciales de administracion incorrectas.", "details": None},
             status=status.HTTP_401_UNAUTHORIZED,
         )
 
+    canonical = _canonical_admin_username(username) or username
     token = create_admin_token(username)
+    admin_data = _build_admin_response(canonical)
     response = Response(
         {
-            "admin": {"username": username},
+            "admin": {
+                "username": username,
+                "id": (admin_data or {}).get("id"),
+                "name": (admin_data or {}).get("name"),
+                "email": (admin_data or {}).get("email"),
+                "role": "admin",
+            },
             "adminToken": token,
             "token": token,
             "accessToken": token,
@@ -602,15 +640,21 @@ def admin_login_view(request):
 @api_view(["POST"])
 @permission_classes([AllowAny])
 def admin_logout_view(request):
-    response = Response({"ok": True})
+    response = Response({"success": True})
     return clear_admin_cookie(response)
 
 
 @api_view(["GET"])
 @permission_classes([AllowAny])
 def admin_me_view(request):
-    admin = get_admin_from_request(request)
-    return Response({"admin": admin})
+    admin_info = get_admin_from_request(request)
+    if not admin_info:
+        return Response(
+            {"error": "ADMIN_UNAUTHORIZED", "message": "No se pudo autenticar la solicitud.", "details": None},
+            status=status.HTTP_401_UNAUTHORIZED,
+        )
+    admin_data = _build_admin_response(admin_info["username"])
+    return Response({"admin": admin_data})
 
 
 def sign_cloudinary_upload(params, api_secret):
@@ -2037,6 +2081,161 @@ def admin_dashboard_stats_view(request):
             ],
         }
     )
+
+
+@api_view(["GET"])
+@permission_classes([IsEnvAdmin])
+def admin_dashboard_view(request):
+    now = timezone.now()
+    first_of_month = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    active_products = Product.objects.filter(is_active=True)
+    all_orders = Order.objects.all()
+
+    sales_this_month = (
+        all_orders.filter(status="completada", created_at__gte=first_of_month)
+        .aggregate(total=Sum("total"))["total"]
+        or Decimal("0")
+    )
+
+    downloads_count = UserEvent.objects.filter(
+        event_type="material_downloaded"
+    ).count()
+
+    recent_orders = (
+        Order.objects.select_related("user")
+        .order_by("-created_at")[:5]
+    )
+    recent_products = active_products.order_by("-created_at")[:5]
+
+    return Response(
+        {
+            "salesThisMonth": str(sales_this_month),
+            "ordersCount": all_orders.count(),
+            "productsCount": active_products.count(),
+            "downloadsCount": downloads_count if downloads_count > 0 else None,
+            "salesTrend": [],
+            "recentOrders": [
+                {
+                    "id": str(o.id),
+                    "customerName": o.customer_name,
+                    "total": str(o.total),
+                    "status": o.status,
+                    "createdAt": o.created_at,
+                }
+                for o in recent_orders
+            ],
+            "recentProducts": [
+                {
+                    "id": str(p.id),
+                    "title": p.title,
+                    "price": str(p.price),
+                    "image": p.image,
+                    "isActive": p.is_active,
+                    "createdAt": p.created_at,
+                }
+                for p in recent_products
+            ],
+        }
+    )
+
+
+@api_view(["GET"])
+@permission_classes([IsEnvAdmin])
+def admin_order_detail_view(request, pk):
+    order = get_object_or_404(
+        Order.objects.select_related("user").prefetch_related("items__product", "payments"),
+        pk=pk,
+    )
+    serializer = OrderSerializer(order)
+    data = serializer.data
+    data["customer"] = {"name": order.customer_name, "email": order.customer_email}
+    latest_payment = order.payments.order_by("-updated_at").first()
+    data["paymentId"] = latest_payment.provider_payment_id if latest_payment else None
+    data["preferenceId"] = order.preference_id
+    data["externalReference"] = order.external_reference
+    return Response({"order": data})
+
+
+@api_view(["GET"])
+@permission_classes([IsEnvAdmin])
+def admin_files_view(request):
+    products_with_downloads = (
+        Product.objects
+        .exclude(download_url="")
+        .order_by("-created_at")
+        .values(
+            "id", "title", "download_url", "download_filename",
+            "download_content_type", "download_size", "created_at",
+        )
+    )
+    items = []
+    for p in products_with_downloads:
+        items.append({
+            "id": str(p["id"]),
+            "productId": str(p["id"]),
+            "productTitle": p["title"],
+            "fileName": p["download_filename"] or None,
+            "fileType": (
+                "pdf" if "pdf" in (p["download_content_type"] or "")
+                else "zip" if "zip" in (p["download_content_type"] or "")
+                else None
+            ),
+            "mimeType": p["download_content_type"] or None,
+            "size": p["download_size"],
+            "url": p["download_url"],
+            "createdAt": p["created_at"],
+        })
+    return Response({"items": items})
+
+
+@api_view(["GET"])
+@permission_classes([IsEnvAdmin])
+def admin_settings_view(request):
+    from .cloudinary_settings import get_saved_cloudinary_settings
+    from .nvidia_settings import get_saved_nvidia_settings
+
+    cloud_settings = get_saved_cloudinary_settings()
+    nv_settings = get_saved_nvidia_settings()
+
+    cloud_configured = bool(
+        cloud_settings
+        or (settings.CLOUDINARY_CLOUD_NAME and settings.CLOUDINARY_API_KEY)
+    )
+    nv_configured = bool(
+        nv_settings
+        or settings.NVIDIA_API_KEY
+    )
+    r2_configured = bool(
+        settings.R2_ACCOUNT_ID
+        and settings.R2_ACCESS_KEY_ID
+        and settings.R2_SECRET_ACCESS_KEY
+        and settings.R2_BUCKET_NAME
+        and settings.R2_PUBLIC_BASE_URL
+    )
+
+    result = {
+        "cloudinary": {
+            "configured": cloud_configured,
+            "cloudName": (
+                cloud_settings.cloud_name
+                if cloud_settings and cloud_settings.cloud_name
+                else (settings.CLOUDINARY_CLOUD_NAME if cloud_configured else None)
+            ),
+        },
+        "nvidia": {
+            "configured": nv_configured,
+            "model": (
+                nv_settings.model
+                if nv_settings and nv_settings.model
+                else (settings.NVIDIA_MODEL if nv_configured else None)
+            ),
+        },
+        "storage": {
+            "configured": r2_configured,
+            "provider": "r2" if r2_configured else None,
+        },
+    }
+    return Response(result)
 
 
 @api_view(["GET"])
