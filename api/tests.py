@@ -8,13 +8,16 @@ from rest_framework_simplejwt.tokens import AccessToken
 
 from .models import (
     Category,
+    Notification,
     PasswordResetRequest,
+    Payment,
     PendingRegistration,
     Product,
     PurchasedProduct,
     Order,
     OrderItem,
     User,
+    UserEvent,
 )
 from .email_service import EmailDeliveryError, make_email_verification_token
 
@@ -1211,3 +1214,494 @@ class AdminAuthTests(TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertNotIn("download_url", response.data)
         self.assertNotIn("downloadUrl", response.data)
+
+    # --- Android Admin API Tests ---
+
+    def test_admin_login_returns_structured_admin(self):
+        response = self.client.post(
+            "/api/admin/login",
+            {"username": "paola-admin", "password": "secreto-admin"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("accessToken", response.data)
+        self.assertIn("admin", response.data)
+        admin = response.data["admin"]
+        self.assertIn("username", admin)
+        self.assertIn("id", admin)
+        self.assertIn("name", admin)
+        self.assertIn("email", admin)
+        self.assertEqual(admin["role"], "admin")
+
+    def test_admin_login_empty_username_returns_400(self):
+        response = self.client.post(
+            "/api/admin/login",
+            {"username": "", "password": "secreto-admin"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.data["error"], "ADMIN_UNAUTHORIZED")
+
+    def test_admin_login_empty_password_returns_400(self):
+        response = self.client.post(
+            "/api/admin/login",
+            {"username": "paola-admin", "password": ""},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.data["error"], "ADMIN_UNAUTHORIZED")
+
+    def test_admin_logout_returns_success(self):
+        login_response = self.client.post(
+            "/api/admin/login",
+            {"username": "paola-admin", "password": "secreto-admin"},
+            format="json",
+        )
+        token = login_response.data["accessToken"]
+        response = self.client.post(
+            "/api/admin/logout",
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.data["success"])
+
+    def test_admin_me_with_bearer_returns_full_admin_data(self):
+        login_response = self.client.post(
+            "/api/admin/login",
+            {"username": "paola-admin", "password": "secreto-admin"},
+            format="json",
+        )
+        token = login_response.data["accessToken"]
+        response = self.client.get(
+            "/api/admin/me",
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+        self.assertEqual(response.status_code, 200)
+        admin = response.data["admin"]
+        self.assertIn("username", admin)
+        self.assertIn("id", admin)
+        self.assertIn("name", admin)
+        self.assertIn("email", admin)
+        self.assertEqual(admin["role"], "admin")
+
+    def test_admin_me_without_token_returns_401(self):
+        response = self.client.get("/api/admin/me")
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(response.data["error"], "ADMIN_UNAUTHORIZED")
+
+    def test_admin_me_with_user_token_returns_no_admin(self):
+        user = User.objects.create(
+            username="user@test.com",
+            email="user@test.com",
+            first_name="User",
+            password=make_password("user123"),
+            email_verified=True,
+            is_admin=False,
+        )
+        token = str(AccessToken.for_user(user))
+        response = self.client.get(
+            "/api/admin/me",
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+        self.assertEqual(response.status_code, 401)
+
+    # --- Dashboard Tests ---
+
+    def test_admin_dashboard_requires_admin(self):
+        response = self.client.get("/api/admin/dashboard")
+        self.assertEqual(response.status_code, 401)
+
+    def test_admin_dashboard_returns_expected_structure(self):
+        login_response = self.client.post(
+            "/api/admin/login",
+            {"username": "paola-admin", "password": "secreto-admin"},
+            format="json",
+        )
+        token = login_response.data["accessToken"]
+        response = self.client.get(
+            "/api/admin/dashboard",
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+        self.assertEqual(response.status_code, 200)
+        data = response.data
+        self.assertIn("salesThisMonth", data)
+        self.assertIn("ordersCount", data)
+        self.assertIn("productsCount", data)
+        self.assertIn("downloadsCount", data)
+        self.assertIn("salesTrend", data)
+        self.assertIn("recentOrders", data)
+        self.assertIn("recentProducts", data)
+        self.assertIsInstance(data["salesTrend"], list)
+        self.assertIsInstance(data["recentOrders"], list)
+        self.assertIsInstance(data["recentProducts"], list)
+
+    def test_admin_dashboard_downloads_count_is_nullable(self):
+        login_response = self.client.post(
+            "/api/admin/login",
+            {"username": "paola-admin", "password": "secreto-admin"},
+            format="json",
+        )
+        token = login_response.data["accessToken"]
+        response = self.client.get(
+            "/api/admin/dashboard",
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertIsNone(response.data["downloadsCount"])
+
+    # --- Product Admin Tests ---
+
+    def test_admin_products_list_with_bearer(self):
+        Product.objects.create(
+            title="Test Product",
+            description="Desc",
+            price="1000.00",
+            category_id="estimulacion",
+            image="/images/products/default.jpg",
+            age="6-8",
+            level="Inicial",
+            features=[],
+            objectives=[],
+        )
+        login_response = self.client.post(
+            "/api/admin/login",
+            {"username": "paola-admin", "password": "secreto-admin"},
+            format="json",
+        )
+        token = login_response.data["accessToken"]
+        response = self.client.get(
+            "/api/admin/products",
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+        self.assertEqual(response.status_code, 200)
+
+    def test_admin_product_create_and_update_with_bearer(self):
+        login_response = self.client.post(
+            "/api/admin/login",
+            {"username": "paola-admin", "password": "secreto-admin"},
+            format="json",
+        )
+        token = login_response.data["accessToken"]
+        create_response = self.client.post(
+            "/api/admin/products",
+            {
+                "title": "Nuevo Producto",
+                "description": "Descripcion del producto",
+                "price": "2500.00",
+                "category": "estimulacion",
+                "age": "6-8",
+                "level": "Inicial",
+                "features": [],
+                "objectives": [],
+            },
+            format="json",
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+        self.assertEqual(create_response.status_code, 201)
+        product_id = create_response.data["id"]
+        self.assertIsNotNone(product_id)
+
+        update_response = self.client.patch(
+            f"/api/admin/products/{product_id}",
+            {"title": "Titulo Actualizado"},
+            format="json",
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+        self.assertEqual(update_response.status_code, 200)
+        self.assertEqual(update_response.data["title"], "Titulo Actualizado")
+
+    def test_admin_product_soft_delete(self):
+        login_response = self.client.post(
+            "/api/admin/login",
+            {"username": "paola-admin", "password": "secreto-admin"},
+            format="json",
+        )
+        token = login_response.data["accessToken"]
+        create_response = self.client.post(
+            "/api/admin/products",
+            {
+                "title": "Para Eliminar",
+                "description": "Se desactivara",
+                "price": "1500.00",
+                "category": "estimulacion",
+                "age": "6-8",
+                "level": "Inicial",
+                "features": [],
+                "objectives": [],
+            },
+            format="json",
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+        product_id = create_response.data["id"]
+
+        self.client.delete(
+            f"/api/admin/products/{product_id}",
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+        product = Product.objects.get(id=product_id)
+        self.assertFalse(product.is_active)
+
+    # --- Order Admin Tests ---
+
+    def test_admin_orders_list_with_bearer(self):
+        login_response = self.client.post(
+            "/api/admin/login",
+            {"username": "paola-admin", "password": "secreto-admin"},
+            format="json",
+        )
+        token = login_response.data["accessToken"]
+        response = self.client.get(
+            "/api/admin/orders",
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("orders", response.data)
+
+    def test_admin_order_detail_with_bearer(self):
+        user = User.objects.create(
+            username="buyer@test.com",
+            email="buyer@test.com",
+            first_name="Buyer",
+            password=make_password("buyer123"),
+            email_verified=True,
+        )
+        product = Product.objects.create(
+            title="Order Product",
+            description="Desc",
+            price="2000.00",
+            category_id="estimulacion",
+            image="/images/products/default.jpg",
+            age="6-8",
+            level="Inicial",
+            features=[],
+            objectives=[],
+        )
+        order = Order.objects.create(
+            user=user,
+            total="2000.00",
+            status="completada",
+            customer_name="Buyer",
+            customer_email="buyer@test.com",
+        )
+        OrderItem.objects.create(
+            order=order, product=product, quantity=1, price="2000.00"
+        )
+        login_response = self.client.post(
+            "/api/admin/login",
+            {"username": "paola-admin", "password": "secreto-admin"},
+            format="json",
+        )
+        token = login_response.data["accessToken"]
+        response = self.client.get(
+            f"/api/admin/orders/{order.id}",
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("order", response.data)
+        order_data = response.data["order"]
+        self.assertEqual(order_data["id"], str(order.id))
+        self.assertEqual(order_data["status"], "completada")
+
+    def test_admin_order_detail_404(self):
+        login_response = self.client.post(
+            "/api/admin/login",
+            {"username": "paola-admin", "password": "secreto-admin"},
+            format="json",
+        )
+        token = login_response.data["accessToken"]
+        response = self.client.get(
+            "/api/admin/orders/00000000-0000-0000-0000-000000000000",
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+        self.assertEqual(response.status_code, 404)
+
+    def test_admin_order_detail_requires_admin(self):
+        response = self.client.get(
+            "/api/admin/orders/00000000-0000-0000-0000-000000000000",
+        )
+        self.assertEqual(response.status_code, 401)
+
+    def test_admin_order_list_preserves_existing_contract(self):
+        login_response = self.client.post(
+            "/api/admin/login",
+            {"username": "paola-admin", "password": "secreto-admin"},
+            format="json",
+        )
+        token = login_response.data["accessToken"]
+        response = self.client.get(
+            "/api/admin/orders",
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertIsInstance(response.data["orders"], list)
+
+    # --- Files Tests ---
+
+    def test_admin_files_derives_from_products(self):
+        Product.objects.create(
+            title="Con Descarga",
+            description="Tiene archivo",
+            price="1500.00",
+            category_id="estimulacion",
+            image="/images/products/default.jpg",
+            download_url="https://r2.public/test.pdf",
+            download_filename="test.pdf",
+            download_content_type="application/pdf",
+            download_size=1000,
+            age="6-8",
+            level="Inicial",
+            features=[],
+            objectives=[],
+        )
+        Product.objects.create(
+            title="Sin Descarga",
+            description="No tiene archivo",
+            price="1000.00",
+            category_id="estimulacion",
+            image="/images/products/default.jpg",
+            age="6-8",
+            level="Inicial",
+            features=[],
+            objectives=[],
+        )
+        login_response = self.client.post(
+            "/api/admin/login",
+            {"username": "paola-admin", "password": "secreto-admin"},
+            format="json",
+        )
+        token = login_response.data["accessToken"]
+        response = self.client.get(
+            "/api/admin/files",
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+        self.assertEqual(response.status_code, 200)
+        items = response.data["items"]
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["productTitle"], "Con Descarga")
+        self.assertEqual(items[0]["fileName"], "test.pdf")
+        self.assertEqual(items[0]["url"], "https://r2.public/test.pdf")
+
+    def test_admin_files_nulls_when_metadata_missing(self):
+        Product.objects.create(
+            title="Minimo",
+            description="Solo URL",
+            price="1000.00",
+            category_id="estimulacion",
+            image="/images/products/default.jpg",
+            download_url="https://r2.public/file.zip",
+            age="6-8",
+            level="Inicial",
+            features=[],
+            objectives=[],
+        )
+        login_response = self.client.post(
+            "/api/admin/login",
+            {"username": "paola-admin", "password": "secreto-admin"},
+            format="json",
+        )
+        token = login_response.data["accessToken"]
+        response = self.client.get(
+            "/api/admin/files",
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+        self.assertEqual(response.status_code, 200)
+        item = response.data["items"][0]
+        self.assertIsNone(item["fileName"])
+        self.assertIsNone(item["mimeType"])
+        self.assertIsNone(item["size"])
+        self.assertEqual(item["url"], "https://r2.public/file.zip")
+
+    def test_admin_files_requires_admin(self):
+        response = self.client.get("/api/admin/files")
+        self.assertEqual(response.status_code, 401)
+
+    # --- Settings Tests ---
+
+    def test_admin_settings_requires_admin(self):
+        response = self.client.get("/api/admin/settings")
+        self.assertEqual(response.status_code, 401)
+
+    def test_admin_settings_returns_read_only_structure(self):
+        login_response = self.client.post(
+            "/api/admin/login",
+            {"username": "paola-admin", "password": "secreto-admin"},
+            format="json",
+        )
+        token = login_response.data["accessToken"]
+        response = self.client.get(
+            "/api/admin/settings",
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+        self.assertEqual(response.status_code, 200)
+        data = response.data
+        self.assertIn("cloudinary", data)
+        self.assertIn("nvidia", data)
+        self.assertIn("storage", data)
+        self.assertIn("configured", data["cloudinary"])
+        self.assertIn("configured", data["nvidia"])
+        self.assertIn("configured", data["storage"])
+
+    def test_admin_settings_does_not_expose_secrets(self):
+        login_response = self.client.post(
+            "/api/admin/login",
+            {"username": "paola-admin", "password": "secreto-admin"},
+            format="json",
+        )
+        token = login_response.data["accessToken"]
+        response = self.client.get(
+            "/api/admin/settings",
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+        raw = str(response.data).lower()
+        self.assertNotIn("api_key", raw)
+        self.assertNotIn("secret", raw)
+        self.assertNotIn("password", raw)
+        self.assertNotIn("token", raw)
+        self.assertNotIn("accesskey", raw)
+
+    def test_admin_settings_method_not_allowed(self):
+        login_response = self.client.post(
+            "/api/admin/login",
+            {"username": "paola-admin", "password": "secreto-admin"},
+            format="json",
+        )
+        token = login_response.data["accessToken"]
+        response = self.client.put(
+            "/api/admin/settings",
+            {"dummy": "value"},
+            format="json",
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+        self.assertEqual(response.status_code, 405)
+
+    # --- Workbook Admin Tests ---
+
+    def test_admin_workbooks_list_requires_admin(self):
+        response = self.client.get("/api/admin/workbooks")
+        self.assertEqual(response.status_code, 401)
+
+    @override_settings(NVIDIA_API_KEY="", CLOUDINARY_CLOUD_NAME="", CLOUDINARY_API_KEY="", CLOUDINARY_API_SECRET="")
+    def test_admin_workbooks_create_without_external_services(self):
+        login_response = self.client.post(
+            "/api/admin/login",
+            {"username": "paola-admin", "password": "secreto-admin"},
+            format="json",
+        )
+        token = login_response.data["accessToken"]
+        response = self.client.post(
+            "/api/admin/workbooks",
+            {
+                "title": "Cuadernillo Test",
+                "topic": "matematicas",
+                "age": "6-8",
+                "difficulty": "Inicial",
+                "pages": 10,
+                "brief": "Un cuadernillo de prueba",
+            },
+            format="json",
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.data["workbook"]["title"], "Cuadernillo Test")
+        self.assertIn("id", response.data["workbook"])
+        self.assertEqual(response.data["workbook"]["status"], "planned")
