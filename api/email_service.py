@@ -1,5 +1,5 @@
 import logging
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 import requests
 from django.conf import settings
@@ -12,6 +12,7 @@ from .email_templates import render_email_template
 logger = logging.getLogger(__name__)
 
 EMAIL_VERIFICATION_SALT = "paola-psicope.email-verification"
+GUEST_ORDER_SALT = "paola-psicope.guest-order"
 
 
 class EmailDeliveryError(Exception):
@@ -31,6 +32,29 @@ def read_email_verification_token(token):
         salt=EMAIL_VERIFICATION_SALT,
         max_age=settings.EMAIL_VERIFICATION_TOKEN_TTL_SECONDS,
     )
+
+
+def make_guest_order_token(order):
+    return signing.dumps(
+        {"order_id": str(order.id), "email": order.customer_email.lower()},
+        salt=GUEST_ORDER_SALT,
+    )
+
+
+def read_guest_order_token(token):
+    return signing.loads(
+        token,
+        salt=GUEST_ORDER_SALT,
+        max_age=getattr(settings, "GUEST_ORDER_TOKEN_TTL_SECONDS", 60 * 60 * 24 * 30),
+    )
+
+
+def build_guest_download_url(order, product):
+    token = quote(make_guest_order_token(order), safe="")
+    path = f"/api/orders/{order.id}/downloads/{product.id}?token={token}"
+    if settings.BACKEND_PUBLIC_URL:
+        return f"{settings.BACKEND_PUBLIC_URL.rstrip('/')}{path}"
+    return path
 
 
 def build_email_verification_url(user, request=None):
@@ -207,7 +231,16 @@ def send_resend_email(message):
 def send_purchase_confirmation_email(order, notification=None):
     items = list(order.items.select_related("product"))
     first_product = items[0].product.title if items else "Material comprado"
-    order_url = build_frontend_url(f"/perfil#biblioteca")
+    is_guest = not order.user_id
+    download_links = [
+        {
+            "label": item.product.download_filename or item.product.title,
+            "url": build_guest_download_url(order, item.product),
+        }
+        for item in items
+        if is_guest and item.product.download_url
+    ]
+    order_url = download_links[0]["url"] if download_links else build_frontend_url("/perfil#biblioteca")
 
     rendered = render_email_template("purchase_confirmed", {
         "name": order.customer_name or "familia",
@@ -216,6 +249,8 @@ def send_purchase_confirmation_email(order, notification=None):
         "total": f"$ {order.total}",
         "payment_status": "Aprobado",
         "order_url": order_url,
+        "download_links": download_links,
+        "guest_checkout": is_guest,
     })
 
     return send_resend_email(
