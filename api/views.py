@@ -44,6 +44,7 @@ from .models import (
     PaymentEvent,
     PendingRegistration,
     Product,
+    PushDevice,
     PurchasedProduct,
     UserEvent,
     UserProfile,
@@ -101,6 +102,7 @@ from .nvidia_settings import (
 from .nvidia_client import build_roles, chat_completion, extract_json_object, list_nvidia_models
 from .workbook_generator import build_workbook_plan, infer_workbook_payload_from_chat
 from .workbook_pdf import render_workbook_pdf
+from .push_notifications import firebase_is_configured, send_push_to_user
 
 User = get_user_model()
 
@@ -2511,7 +2513,78 @@ def _deliver_purchase_notification(order, notification):
                 order.purchase_email_sent_at = timezone.now()
                 order.save(update_fields=["purchase_email_sent_at", "updated_at"])
     except EmailDeliveryError:
-        return
+        pass
+
+    send_push_to_user(
+        order.user,
+        title="Tu compra ya esta disponible",
+        body="Ya podes abrir tus recursos desde la biblioteca de Paola Psicope.",
+        data={"target": "resources", "orderId": str(order.id)},
+        notification_type="purchase_confirmed_push",
+        order=order,
+    )
+
+
+@api_view(["POST", "DELETE"])
+@permission_classes([IsAuthenticated])
+def push_device_view(request):
+    token = str(request.data.get("token") or "").strip()
+    if not token or len(token) > 512:
+        return Response({"error": "Token de dispositivo invalido."}, status=status.HTTP_400_BAD_REQUEST)
+
+    if request.method == "DELETE":
+        updated = PushDevice.objects.filter(user=request.user, token=token).update(active=False)
+        return Response({"ok": True, "removed": bool(updated)})
+
+    device, _ = PushDevice.objects.update_or_create(
+        token=token,
+        defaults={
+            "user": request.user,
+            "platform": "android",
+            "device_name": str(request.data.get("deviceName") or "")[:120],
+            "app_version": str(request.data.get("appVersion") or "")[:40],
+            "active": True,
+            "last_seen_at": timezone.now(),
+        },
+    )
+    return Response({
+        "ok": True,
+        "deviceId": str(device.id),
+        "firebaseConfigured": firebase_is_configured(),
+    })
+
+
+@api_view(["POST"])
+@permission_classes([IsEnvAdmin])
+def admin_user_push_view(request, pk):
+    user = get_object_or_404(User, pk=pk)
+    title = str(request.data.get("title") or "").strip()
+    body = str(request.data.get("body") or "").strip()
+    target = str(request.data.get("target") or "home").strip().lower()
+    valid_targets = {"home", "store", "resources", "account", "appointments"}
+
+    if not title or len(title) > 120:
+        return Response({"error": "El titulo es obligatorio y admite hasta 120 caracteres."}, status=status.HTTP_400_BAD_REQUEST)
+    if not body or len(body) > 500:
+        return Response({"error": "El mensaje es obligatorio y admite hasta 500 caracteres."}, status=status.HTTP_400_BAD_REQUEST)
+    if target not in valid_targets:
+        return Response({"error": "Destino de la app invalido."}, status=status.HTTP_400_BAD_REQUEST)
+
+    result = send_push_to_user(
+        user,
+        title=title,
+        body=body,
+        data={"target": target},
+        notification_type="manual_push",
+    )
+    http_status = status.HTTP_200_OK if result["sent"] else status.HTTP_503_SERVICE_UNAVAILABLE
+    return Response({
+        "ok": bool(result["sent"]),
+        "sent": result["sent"],
+        "failed": result["failed"],
+        "reason": result.get("reason", ""),
+        "notificationId": str(result["notification"].id),
+    }, status=http_status)
 
 
 def _webhook_event_identity(request, payment_id):

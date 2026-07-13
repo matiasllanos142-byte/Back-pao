@@ -190,6 +190,46 @@ interface PaolaApi {
 
 El interceptor Android agrega `Authorization: Bearer` y, tras cambiar contraseña, elimina el token local.
 
+## Notificaciones push Android
+
+La app solicita el permiso `POST_NOTIFICATIONS` en Android 13 o superior. Después de iniciar sesión registra el token FCM:
+
+### POST `/notifications/device`
+
+```json
+{
+  "token": "fcm-registration-token",
+  "deviceName": "Pixel 9",
+  "appVersion": "1.1.0"
+}
+```
+
+Requiere `Authorization: Bearer`. El mismo token puede renovarse y queda asociado al usuario autenticado.
+
+### DELETE `/notifications/device`
+
+```json
+{"token": "fcm-registration-token"}
+```
+
+La app lo ejecuta antes de cerrar sesión. El backend lo marca inactivo.
+
+### POST `/admin/users/{userId}/push`
+
+Requiere sesión de administración:
+
+```json
+{
+  "title": "Nuevo recurso disponible",
+  "body": "Ya podés abrirlo desde tu biblioteca.",
+  "target": "resources"
+}
+```
+
+Destinos admitidos: `home`, `store`, `resources`, `account`, `appointments`.
+
+Variables privadas del backend: `FIREBASE_SERVICE_ACCOUNT_JSON` o `FIREBASE_SERVICE_ACCOUNT_BASE64`. También se admite `GOOGLE_APPLICATION_CREDENTIALS` fuera de Railway. Nunca incluir la cuenta de servicio en Git.
+
 ## Distribución de APK
 
 ### GET `/app/android/latest`

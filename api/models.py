@@ -145,6 +145,31 @@ class Notification(models.Model):
         return f"{self.type} -> {self.recipient} [{self.status}]"
 
 
+class PushDevice(models.Model):
+    PLATFORM_CHOICES = [("android", "Android")]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name="push_devices")
+    token = models.CharField(max_length=512, unique=True)
+    platform = models.CharField(max_length=20, choices=PLATFORM_CHOICES, default="android")
+    device_name = models.CharField(max_length=120, blank=True)
+    app_version = models.CharField(max_length=40, blank=True)
+    active = models.BooleanField(default=True)
+    last_seen_at = models.DateTimeField(default=timezone.now)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "push_devices"
+        indexes = [
+            models.Index(fields=["user", "active"], name="push_user_active_idx"),
+            models.Index(fields=["platform", "active"], name="push_platform_active_idx"),
+        ]
+
+    def __str__(self):
+        return f"{self.user.email} [{self.platform}]"
+
+
 class UserEvent(models.Model):
     EVENT_TYPES = [
         ("account_registered", "Account Registered"),
