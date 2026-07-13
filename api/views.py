@@ -2027,6 +2027,9 @@ def admin_dashboard_stats_view(request):
     products = Product.objects.filter(is_active=True)
     orders = Order.objects.all()
     completed_orders = orders.filter(status="completada")
+    pending_orders = orders.filter(status="pendiente")
+    failed_orders = orders.filter(status="fallida")
+    refunded_orders = orders.filter(status="reembolsada")
     revenue = completed_orders.aggregate(total=Sum("total"))["total"] or Decimal("0")
     sold_units = OrderItem.objects.filter(order__status="completada").aggregate(
         total=Sum("quantity")
@@ -2045,14 +2048,19 @@ def admin_dashboard_stats_view(request):
         .order_by("-quantity")[:5]
     )
 
-    return Response(
+    response = Response(
         {
+            "generatedAt": timezone.now(),
             "summary": {
                 "products": products.count(),
                 "featuredProducts": products.filter(featured=True).count(),
                 "categories": categories.count(),
                 "orders": orders.count(),
+                "purchases": completed_orders.count(),
                 "completedOrders": completed_orders.count(),
+                "pendingOrders": pending_orders.count(),
+                "failedOrders": failed_orders.count(),
+                "refundedOrders": refunded_orders.count(),
                 "soldUnits": sold_units,
                 "revenue": str(revenue),
                 "productsWithImages": products.exclude(image="").count(),
@@ -2081,6 +2089,9 @@ def admin_dashboard_stats_view(request):
             ],
         }
     )
+    response["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    response["Pragma"] = "no-cache"
+    return response
 
 
 @api_view(["GET"])
