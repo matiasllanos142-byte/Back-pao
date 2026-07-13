@@ -704,7 +704,7 @@ class AdminAuthTests(TestCase):
         self.assertTrue(user.email_verified)
         self.assertIsNotNone(user.email_verified_at)
 
-    def test_payment_requires_user_session(self):
+    def test_payment_allows_guest_email(self):
         product = Product.objects.create(
             title="Recurso privado",
             description="Material descargable.",
@@ -726,7 +726,11 @@ class AdminAuthTests(TestCase):
             format="json",
         )
 
-        self.assertEqual(response.status_code, 401)
+        self.assertEqual(response.status_code, 200)
+        order = Order.objects.get(id=response.data["orderId"])
+        self.assertIsNone(order.user)
+        self.assertEqual(order.customer_email, "invitado@test.com")
+        self.assertTrue(response.data["guestToken"])
 
     def test_completed_payment_grants_library_download_access(self):
         product = Product.objects.create(

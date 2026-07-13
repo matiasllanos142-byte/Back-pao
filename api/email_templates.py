@@ -250,6 +250,8 @@ def _purchase_confirmed_html(context):
     total = context.get("total", "")
     payment_status = context.get("payment_status", "")
     order_url = context.get("order_url", "")
+    download_links = context.get("download_links", []) or []
+    guest_checkout = bool(context.get("guest_checkout"))
 
     details = []
     if product_title:
@@ -272,14 +274,26 @@ def _purchase_confirmed_html(context):
         f'{rows}</table>'
     )
 
-    cta = _cta_button(order_url or _frontend_url() + "/perfil#biblioteca", "Ver detalle")
+    if download_links:
+        cta = "".join(
+            _cta_button(item.get("url", ""), f"Descargar {item.get('label') or 'material'}")
+            for item in download_links
+        )
+    else:
+        cta = _cta_button(order_url or _frontend_url() + "/perfil#biblioteca", "Ver detalle")
 
     heading = "Compra confirmada"
-    paras = [
-        "Recibimos tu compra y ya está confirmada. El recurso queda disponible en tu cuenta "
-        "para que lo descargues cuando lo necesites.",
-        "Por seguridad no adjuntamos archivos en este email. Las descargas se realizan desde tu cuenta.",
-    ]
+    paras = (
+        [
+            "Recibimos tu compra y ya está confirmada. Podés descargar los materiales desde los botones de este email.",
+            "Guardá este mensaje: los enlaces son personales y estarán disponibles durante 30 días.",
+        ]
+        if guest_checkout
+        else [
+            "Recibimos tu compra y ya está confirmada. El recurso queda disponible en tu cuenta para que lo descargues cuando lo necesites.",
+            "Por seguridad no adjuntamos archivos en este email. Las descargas se realizan desde tu cuenta.",
+        ]
+    )
     return _body_html(context, heading, paras, extra_block=extra, cta_html=cta)
 
 
@@ -535,20 +549,29 @@ def _password_reset_text(context):
 
 
 def _purchase_confirmed_text(context):
+    guest_checkout = bool(context.get("guest_checkout"))
+    download_links = context.get("download_links", []) or []
     lines = [
         f"Hola {context.get('name', '')},",
         "",
         "Recibimos tu compra y ya está confirmada.",
-        "El recurso queda disponible en tu cuenta para que lo descargues cuando lo necesites.",
+        (
+            "Descargá los materiales desde los enlaces personales de este email."
+            if guest_checkout
+            else "El recurso queda disponible en tu cuenta para que lo descargues cuando lo necesites."
+        ),
         "",
         f"Producto: {context.get('product_title', '')}",
         f"Orden: {context.get('order_id', '')}",
         f"Total: {context.get('total', '')}",
         f"Estado: {context.get('payment_status', '')}",
         "",
-        f"Ver detalle: {context.get('order_url', '')}",
+        *(f"Descargar {item.get('label') or 'material'}: {item.get('url', '')}" for item in download_links),
+        *([] if download_links else [f"Ver detalle: {context.get('order_url', '')}"]),
         "",
-        "Por seguridad no adjuntamos archivos en este email.",
+        "Guardá este email: los enlaces de invitado están disponibles durante 30 días."
+        if guest_checkout
+        else "Por seguridad no adjuntamos archivos en este email.",
         "Paola Psicopé",
     ]
     return "\n".join(lines)
