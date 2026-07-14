@@ -3256,6 +3256,7 @@ ZIP_MAX_BYTES = 50 * 1024 * 1024  # 50 MB
 EXECUTABLE_EXTENSIONS = {".exe", ".bat", ".cmd", ".com", ".msi", ".scr", ".pif", ".sh", ".bin", ".app"}
 BUNDLE_SCHEMA_VERSION = "paola-product-bundle-v1"
 VALID_LEVELS = {"Inicial", "Intermedio", "Avanzado"}
+VALID_PRODUCT_TYPES = {"product", "workshop"}
 
 
 def _upload_image_to_cloudinary_from_bytes(file_bytes, filename, content_type):
@@ -3465,6 +3466,7 @@ def admin_product_import_bundle_preview_view(request):
         title = (product_raw.get("title") or "").strip()
         description = (product_raw.get("description") or "").strip()
         category_slug = (product_raw.get("category") or "").strip()
+        product_type = (product_raw.get("productType") or "product").strip().lower()
         price = product_raw.get("price")
         compare_at_price = product_raw.get("compareAtPrice")
         age = (product_raw.get("age") or "").strip()
@@ -3496,6 +3498,8 @@ def admin_product_import_bundle_preview_view(request):
 
         if level not in VALID_LEVELS:
             return Response({"error": f"Nivel no valido: '{level}'."}, status=status.HTTP_400_BAD_REQUEST)
+        if product_type not in VALID_PRODUCT_TYPES:
+            return Response({"error": f"Tipo no valido: '{product_type}'."}, status=status.HTTP_400_BAD_REQUEST)
 
         cover_file_name = Path(cover_path).name
         cover_ext = Path(cover_file_name).suffix.lower()
@@ -3563,6 +3567,7 @@ def admin_product_import_bundle_preview_view(request):
                 "price": price,
                 "compareAtPrice": compare_at_price,
                 "category": category_slug,
+                "productType": product_type,
                 "level": level,
                 "age": age,
                 "badge": badge,
@@ -3692,7 +3697,7 @@ def admin_product_import_bundle_view(request):
             if isinstance(overrides_data.get("product"), dict):
                 merged_product = dict(product_raw)
                 override_product = overrides_data["product"]
-                allowed_override_keys = {"title", "description", "price", "compareAtPrice", "category", "level", "age", "badge", "featured", "features", "objectives"}
+                allowed_override_keys = {"title", "description", "price", "compareAtPrice", "category", "productType", "level", "age", "badge", "featured", "features", "objectives"}
                 for key, value in override_product.items():
                     if key in allowed_override_keys:
                         merged_product[key] = value
@@ -3701,6 +3706,7 @@ def admin_product_import_bundle_view(request):
         title = (product_raw.get("title") or "").strip()
         description = (product_raw.get("description") or "").strip()
         category_slug = (product_raw.get("category") or "").strip()
+        product_type = (product_raw.get("productType") or "product").strip().lower()
         price = product_raw.get("price")
         compare_at_price = product_raw.get("compareAtPrice")
         age = (product_raw.get("age") or "").strip()
@@ -3742,6 +3748,11 @@ def admin_product_import_bundle_view(request):
         if level not in VALID_LEVELS:
             return Response(
                 {"error": f"Nivel no valido: '{level}'. Debe ser uno de: {', '.join(sorted(VALID_LEVELS))}."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if product_type not in VALID_PRODUCT_TYPES:
+            return Response(
+                {"error": f"Tipo no valido: '{product_type}'. Debe ser 'product' o 'workshop'."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
@@ -3853,6 +3864,7 @@ def admin_product_import_bundle_view(request):
             "price": str(price),
             "compare_at_price": str(compare_at_price) if compare_at_price else None,
             "category": category_slug,
+            "product_type": product_type,
             "image": cloudinary_result["url"],
             "image_public_id": cloudinary_result["publicId"],
             "download_url": r2_result["url"],
