@@ -40,8 +40,8 @@ class CategoryAdmin(admin.ModelAdmin):
 
 @admin.register(Product)
 class ProductAdmin(admin.ModelAdmin):
-    list_display = ["title", "category", "price", "compare_at_price", "featured", "is_active", "created_at"]
-    list_filter = ["category", "featured", "is_active", "level"]
+    list_display = ["title", "product_type", "category", "price", "compare_at_price", "featured", "is_active", "created_at"]
+    list_filter = ["product_type", "category", "featured", "is_active", "level"]
     search_fields = ["title", "description"]
 
 
