@@ -277,6 +277,13 @@ class Category(models.Model):
 
 
 class Product(models.Model):
+    PRODUCT_TYPE_PRODUCT = "product"
+    PRODUCT_TYPE_WORKSHOP = "workshop"
+    PRODUCT_TYPE_CHOICES = [
+        (PRODUCT_TYPE_PRODUCT, "Producto digital"),
+        (PRODUCT_TYPE_WORKSHOP, "Taller"),
+    ]
+
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     title = models.CharField(max_length=300)
     description = models.TextField()
@@ -284,6 +291,12 @@ class Product(models.Model):
     compare_at_price = models.DecimalField(max_digits=10, decimal_places=2, blank=True, null=True)
     category = models.ForeignKey(
         Category, on_delete=models.PROTECT, related_name="products", db_column="category_slug"
+    )
+    product_type = models.CharField(
+        max_length=20,
+        choices=PRODUCT_TYPE_CHOICES,
+        default=PRODUCT_TYPE_PRODUCT,
+        db_index=True,
     )
     image = models.CharField(max_length=500, default="/images/products/placeholder.jpg")
     image_public_id = models.CharField(max_length=500, blank=True)

@@ -21,6 +21,8 @@ from rest_framework_simplejwt.tokens import AccessToken
 from django.contrib.auth import get_user_model
 from django.contrib.auth.hashers import check_password, make_password
 from django.core import signing
+from django.core.exceptions import ValidationError
+from django.core.validators import validate_email
 from django.db import transaction
 from django.db.models import Count, DecimalField, IntegerField, OuterRef, Q, Subquery, Sum, Value
 from django.db.models.functions import Coalesce
@@ -72,6 +74,8 @@ from .admin_auth import (
 )
 from .email_service import (
     EmailDeliveryError,
+    make_guest_order_token,
+    read_guest_order_token,
     read_email_verification_token,
     send_abandoned_cart_email,
     send_download_help_email,
@@ -147,6 +151,8 @@ def password_reset_expires_at():
 
 
 def _record_event(user, event_type, entity_type="", entity_id="", metadata=None):
+    if not user or not getattr(user, "is_authenticated", False):
+        return
     try:
         UserEvent.objects.create(
             user=user,
@@ -1272,18 +1278,19 @@ def admin_workbook_pdf_view(request, pk):
 
 
 def grant_order_access(order):
-    if not order.user_id or order.status != "completada":
+    if order.status != "completada":
         return
 
-    for item in order.items.select_related("product"):
-        PurchasedProduct.objects.update_or_create(
-            user=order.user,
-            product=item.product,
-            defaults={
-                "order": order,
-                "is_active": True,
-            },
-        )
+    if order.user_id:
+        for item in order.items.select_related("product"):
+            PurchasedProduct.objects.update_or_create(
+                user=order.user,
+                product=item.product,
+                defaults={
+                    "order": order,
+                    "is_active": True,
+                },
+            )
 
     send_purchase_confirmation_email_once(order)
 
@@ -2029,6 +2036,9 @@ def admin_dashboard_stats_view(request):
     products = Product.objects.filter(is_active=True)
     orders = Order.objects.all()
     completed_orders = orders.filter(status="completada")
+    pending_orders = orders.filter(status="pendiente")
+    failed_orders = orders.filter(status="fallida")
+    refunded_orders = orders.filter(status="reembolsada")
     revenue = completed_orders.aggregate(total=Sum("total"))["total"] or Decimal("0")
     sold_units = OrderItem.objects.filter(order__status="completada").aggregate(
         total=Sum("quantity")
@@ -2047,14 +2057,19 @@ def admin_dashboard_stats_view(request):
         .order_by("-quantity")[:5]
     )
 
-    return Response(
+    response = Response(
         {
+            "generatedAt": timezone.now(),
             "summary": {
                 "products": products.count(),
                 "featuredProducts": products.filter(featured=True).count(),
                 "categories": categories.count(),
                 "orders": orders.count(),
+                "purchases": completed_orders.count(),
                 "completedOrders": completed_orders.count(),
+                "pendingOrders": pending_orders.count(),
+                "failedOrders": failed_orders.count(),
+                "refundedOrders": refunded_orders.count(),
                 "soldUnits": sold_units,
                 "revenue": str(revenue),
                 "productsWithImages": products.exclude(image="").count(),
@@ -2083,6 +2098,9 @@ def admin_dashboard_stats_view(request):
             ],
         }
     )
+    response["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    response["Pragma"] = "no-cache"
+    return response
 
 
 @api_view(["GET"])
@@ -2319,12 +2337,24 @@ def order_detail_view(request, pk):
 
 
 @api_view(["POST"])
-@permission_classes([IsAuthenticated])
+@permission_classes([AllowAny])
 def create_payment_preference_view(request):
     items_data = request.data.get("items", [])
     customer = request.data.get("customer", {})
-    customer_name = customer.get("name", "").strip() or request.user.first_name
-    customer_email = request.user.email.lower().strip()
+    user = request.user if request.user.is_authenticated else None
+    customer_email = (user.email if user else customer.get("email", "")).lower().strip()
+    customer_name = customer.get("name", "").strip() or (user.first_name if user else "")
+
+    try:
+        validate_email(customer_email)
+    except ValidationError:
+        return Response(
+            {"error": "Ingresá un correo electrónico válido."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    if not customer_name:
+        customer_name = customer_email.split("@", 1)[0].replace(".", " ").strip().title() or "Cliente"
 
     if not items_data or not customer_name or not customer_email:
         return Response({"error": "Datos incompletos."}, status=status.HTTP_400_BAD_REQUEST)
@@ -2357,7 +2387,7 @@ def create_payment_preference_view(request):
     total = sum(item["product"].price * item["quantity"] for item in order_items)
 
     order = Order.objects.create(
-        user=request.user,
+        user=user,
         total=total,
         status="completada" if not settings.MP_ACCESS_TOKEN else "pendiente",
         customer_name=customer_name,
@@ -2366,6 +2396,7 @@ def create_payment_preference_view(request):
     )
     order.external_reference = str(order.id)
     order.save(update_fields=["external_reference", "updated_at"])
+    guest_token = make_guest_order_token(order) if not user else ""
 
     for item in order_items:
         OrderItem.objects.create(
@@ -2380,7 +2411,8 @@ def create_payment_preference_view(request):
         return Response({
             "demo": True,
             "orderId": str(order.id),
-            "init_point": f"{base_url}/checkout/success?order_id={order.id}",
+            "init_point": f"{base_url}/checkout/success?order_id={order.id}" + (f"&guest_token={guest_token}" if guest_token else ""),
+            "guestToken": guest_token or None,
         })
 
     mercado_pago_mode = get_mercado_pago_mode()
@@ -2400,7 +2432,9 @@ def create_payment_preference_view(request):
         )
 
     notification_url = get_payment_notification_url(request)
-    _record_event(request.user, "checkout_started", "order", order.id)
+    _record_event(user, "checkout_started", "order", order.id)
+
+    guest_query = f"&guest_token={guest_token}" if guest_token else ""
 
     preference_payload = {
         "items": [
@@ -2415,16 +2449,16 @@ def create_payment_preference_view(request):
         ],
         "payer": {"name": customer_name, "email": customer_email},
         "back_urls": {
-            "success": f"{base_url}/checkout/success?order_id={order.id}",
-            "failure": f"{base_url}/checkout/failure?order_id={order.id}",
-            "pending": f"{base_url}/checkout/pending?order_id={order.id}",
+            "success": f"{base_url}/checkout/success?order_id={order.id}{guest_query}",
+            "failure": f"{base_url}/checkout/failure?order_id={order.id}{guest_query}",
+            "pending": f"{base_url}/checkout/pending?order_id={order.id}{guest_query}",
         },
         "auto_return": "approved",
         "external_reference": str(order.id),
         "notification_url": notification_url,
         "metadata": {
             "order_id": str(order.id),
-            "user_id": str(request.user.id),
+            **({"user_id": str(user.id)} if user else {"guest_checkout": True}),
         },
     }
     preference_client = get_mercado_pago_sdk().preference()
@@ -2477,7 +2511,7 @@ def create_payment_preference_view(request):
             status=status.HTTP_502_BAD_GATEWAY,
         )
 
-    _record_event(request.user, "payment_pending", "order", order.id)
+    _record_event(user, "payment_pending", "order", order.id)
 
     return Response({
         "init_point": init_point,
@@ -2485,6 +2519,7 @@ def create_payment_preference_view(request):
         "preferenceId": order.preference_id,
         "notificationUrl": notification_url,
         "mpMode": mercado_pago_mode,
+        "guestToken": guest_token or None,
     })
 
 
@@ -2613,12 +2648,13 @@ def _complete_order(order, payment_data):
     order.paid_at = now
     order.save(update_fields=["status", "payment_id", "paid_at", "updated_at"])
 
-    for item in order.items.select_related("product"):
-        PurchasedProduct.objects.update_or_create(
-            user=order.user,
-            product=item.product,
-            defaults={"order": order, "is_active": True},
-        )
+    if order.user_id:
+        for item in order.items.select_related("product"):
+            PurchasedProduct.objects.update_or_create(
+                user=order.user,
+                product=item.product,
+                defaults={"order": order, "is_active": True},
+            )
 
     _record_event(order.user, "payment_approved", "order", order.id)
     _record_event(order.user, "library_access_granted", "order", order.id)
@@ -2628,6 +2664,46 @@ def _complete_order(order, payment_data):
         user=order.user,
         order=order,
     )
+
+
+def _guest_order_from_token(pk, token):
+    try:
+        payload = read_guest_order_token(token)
+    except signing.BadSignature:
+        return None
+    if str(payload.get("order_id")) != str(pk):
+        return None
+    order = Order.objects.filter(pk=pk, user__isnull=True).first()
+    if not order or payload.get("email", "").lower() != order.customer_email.lower():
+        return None
+    return order
+
+
+@api_view(["GET"])
+@permission_classes([AllowAny])
+def guest_order_detail_view(request, pk):
+    order = _guest_order_from_token(pk, request.query_params.get("token", ""))
+    if not order:
+        return Response({"error": "Enlace inválido o vencido."}, status=status.HTTP_403_FORBIDDEN)
+    return Response({"order": OrderSerializer(order).data})
+
+
+@api_view(["GET"])
+@permission_classes([AllowAny])
+def guest_order_download_view(request, pk, product_pk):
+    order = _guest_order_from_token(pk, request.query_params.get("token", ""))
+    if not order or order.status != "completada":
+        return Response({"error": "Descarga no disponible."}, status=status.HTTP_403_FORBIDDEN)
+    item = get_object_or_404(order.items.select_related("product"), product_id=product_pk)
+    if not item.product.download_url:
+        return Response(
+            {"error": "Este producto todavía no tiene archivo descargable."},
+            status=status.HTTP_404_NOT_FOUND,
+        )
+    response = redirect(item.product.download_url)
+    response["Cache-Control"] = "private, no-store"
+    response["Referrer-Policy"] = "no-referrer"
+    return response
 
 
 def _finish_payment_event(event, *, processed=True, error_message=""):
@@ -3253,6 +3329,7 @@ ZIP_MAX_BYTES = 50 * 1024 * 1024  # 50 MB
 EXECUTABLE_EXTENSIONS = {".exe", ".bat", ".cmd", ".com", ".msi", ".scr", ".pif", ".sh", ".bin", ".app"}
 BUNDLE_SCHEMA_VERSION = "paola-product-bundle-v1"
 VALID_LEVELS = {"Inicial", "Intermedio", "Avanzado"}
+VALID_PRODUCT_TYPES = {"product", "workshop"}
 
 
 def _upload_image_to_cloudinary_from_bytes(file_bytes, filename, content_type):
@@ -3462,6 +3539,7 @@ def admin_product_import_bundle_preview_view(request):
         title = (product_raw.get("title") or "").strip()
         description = (product_raw.get("description") or "").strip()
         category_slug = (product_raw.get("category") or "").strip()
+        product_type = (product_raw.get("productType") or "product").strip().lower()
         price = product_raw.get("price")
         compare_at_price = product_raw.get("compareAtPrice")
         age = (product_raw.get("age") or "").strip()
@@ -3493,6 +3571,8 @@ def admin_product_import_bundle_preview_view(request):
 
         if level not in VALID_LEVELS:
             return Response({"error": f"Nivel no valido: '{level}'."}, status=status.HTTP_400_BAD_REQUEST)
+        if product_type not in VALID_PRODUCT_TYPES:
+            return Response({"error": f"Tipo no valido: '{product_type}'."}, status=status.HTTP_400_BAD_REQUEST)
 
         cover_file_name = Path(cover_path).name
         cover_ext = Path(cover_file_name).suffix.lower()
@@ -3560,6 +3640,7 @@ def admin_product_import_bundle_preview_view(request):
                 "price": price,
                 "compareAtPrice": compare_at_price,
                 "category": category_slug,
+                "productType": product_type,
                 "level": level,
                 "age": age,
                 "badge": badge,
@@ -3689,7 +3770,7 @@ def admin_product_import_bundle_view(request):
             if isinstance(overrides_data.get("product"), dict):
                 merged_product = dict(product_raw)
                 override_product = overrides_data["product"]
-                allowed_override_keys = {"title", "description", "price", "compareAtPrice", "category", "level", "age", "badge", "featured", "features", "objectives"}
+                allowed_override_keys = {"title", "description", "price", "compareAtPrice", "category", "productType", "level", "age", "badge", "featured", "features", "objectives"}
                 for key, value in override_product.items():
                     if key in allowed_override_keys:
                         merged_product[key] = value
@@ -3698,6 +3779,7 @@ def admin_product_import_bundle_view(request):
         title = (product_raw.get("title") or "").strip()
         description = (product_raw.get("description") or "").strip()
         category_slug = (product_raw.get("category") or "").strip()
+        product_type = (product_raw.get("productType") or "product").strip().lower()
         price = product_raw.get("price")
         compare_at_price = product_raw.get("compareAtPrice")
         age = (product_raw.get("age") or "").strip()
@@ -3739,6 +3821,11 @@ def admin_product_import_bundle_view(request):
         if level not in VALID_LEVELS:
             return Response(
                 {"error": f"Nivel no valido: '{level}'. Debe ser uno de: {', '.join(sorted(VALID_LEVELS))}."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if product_type not in VALID_PRODUCT_TYPES:
+            return Response(
+                {"error": f"Tipo no valido: '{product_type}'. Debe ser 'product' o 'workshop'."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
@@ -3850,6 +3937,7 @@ def admin_product_import_bundle_view(request):
             "price": str(price),
             "compare_at_price": str(compare_at_price) if compare_at_price else None,
             "category": category_slug,
+            "product_type": product_type,
             "image": cloudinary_result["url"],
             "image_public_id": cloudinary_result["publicId"],
             "download_url": r2_result["url"],

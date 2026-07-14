@@ -1,3 +1,7 @@
+import json
+import zipfile
+from io import BytesIO
+
 from django.contrib.auth.hashers import make_password
 from django.test import TestCase, override_settings
 from django.core.files.uploadedfile import SimpleUploadedFile
@@ -236,6 +240,7 @@ class AdminAuthTests(TestCase):
 
         self.assertEqual(response.status_code, 201)
         self.assertEqual(response.data["title"], "Producto bearer")
+        self.assertEqual(response.data["product_type"], "product")
 
     def test_public_user_session_cannot_create_admin_product(self):
         self.create_verified_user("cliente@test.com")
@@ -304,6 +309,7 @@ class AdminAuthTests(TestCase):
                 "description": "Material descargable.",
                 "price": "2500.00",
                 "category": "estimulacion",
+                "product_type": "workshop",
                 "image": "/images/products/default.jpg",
                 "featured": True,
                 "age": "6-8 anos",
@@ -316,6 +322,53 @@ class AdminAuthTests(TestCase):
 
         self.assertEqual(response.status_code, 201)
         self.assertEqual(response.data["title"], "Cuadernillo inicial")
+        self.assertEqual(response.data["product_type"], "workshop")
+        self.assertEqual(Product.objects.get(id=response.data["id"]).product_type, "workshop")
+
+    def test_zip_preview_exposes_workshop_type(self):
+        login_response = self.client.post(
+            "/api/admin/login",
+            {"username": "paola-admin", "password": "secreto-admin"},
+            format="json",
+        )
+        self.assertEqual(login_response.status_code, 200)
+
+        manifest = {
+            "schemaVersion": "paola-product-bundle-v1",
+            "product": {
+                "title": "Taller para familias",
+                "description": "Encuentro práctico para acompañar aprendizajes.",
+                "price": 12000,
+                "category": "estimulacion",
+                "productType": "workshop",
+                "age": "Adultos",
+                "level": "Inicial",
+            },
+            "assets": {
+                "coverImage": "portada.png",
+                "downloadFile": "material.pdf",
+            },
+        }
+        bundle = BytesIO()
+        with zipfile.ZipFile(bundle, "w") as archive:
+            archive.writestr("manifest.json", json.dumps(manifest))
+            archive.writestr("portada.png", b"fake-image")
+            archive.writestr("material.pdf", b"fake-pdf")
+
+        response = self.client.post(
+            "/api/admin/products/import-bundle/preview",
+            {
+                "file": SimpleUploadedFile(
+                    "taller.zip",
+                    bundle.getvalue(),
+                    content_type="application/zip",
+                )
+            },
+            format="multipart",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["preview"]["product"]["productType"], "workshop")
 
     def test_admin_create_product_accepts_new_category_and_argentine_prices(self):
         Category.objects.all().delete()
@@ -704,7 +757,7 @@ class AdminAuthTests(TestCase):
         self.assertTrue(user.email_verified)
         self.assertIsNotNone(user.email_verified_at)
 
-    def test_payment_requires_user_session(self):
+    def test_payment_allows_guest_email(self):
         product = Product.objects.create(
             title="Recurso privado",
             description="Material descargable.",
@@ -726,7 +779,11 @@ class AdminAuthTests(TestCase):
             format="json",
         )
 
-        self.assertEqual(response.status_code, 401)
+        self.assertEqual(response.status_code, 200)
+        order = Order.objects.get(id=response.data["orderId"])
+        self.assertIsNone(order.user)
+        self.assertEqual(order.customer_email, "invitado@test.com")
+        self.assertTrue(response.data["guestToken"])
 
     def test_completed_payment_grants_library_download_access(self):
         product = Product.objects.create(
