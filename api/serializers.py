@@ -336,13 +336,19 @@ class OrderSerializer(serializers.ModelSerializer):
             "payment_id",
             "external_reference",
             "customer",
+            "promo_code",
+            "discount_amount",
             "items",
             "created_at",
         ]
         read_only_fields = ["preference_id", "payment_id", "external_reference", "created_at"]
 
     def get_customer(self, obj):
-        return {"name": obj.customer_name, "email": obj.customer_email}
+        return {
+            "name": obj.customer_name,
+            "email": obj.customer_email,
+            "phone": obj.customer_phone,
+        }
 
     def create(self, validated_data):
         items_data = validated_data.pop("items")

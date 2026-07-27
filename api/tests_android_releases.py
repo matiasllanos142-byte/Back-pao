@@ -63,6 +63,10 @@ class AndroidReleaseTests(APITestCase):
         self.assertEqual(response.data["tag"], "v1.2.3")
         self.assertEqual(response.data["fileName"], "paola-psicope.apk")
         self.assertEqual(response.data["downloadUrl"], "/api/app/android/download")
+        self.assertEqual(
+            response["Cache-Control"],
+            "no-store, no-cache, must-revalidate, max-age=0",
+        )
 
     @patch("api.android_releases.requests.get")
     def test_latest_never_exposes_github_url_or_token(self, mocked_get):
@@ -122,10 +126,17 @@ class AndroidReleaseTests(APITestCase):
         self.assertEqual(response.data["sha256"], "a" * 64)
 
     @patch("api.android_releases.requests.get")
-    def test_metadata_cache_avoids_repeated_github_calls(self, mocked_get):
+    def test_force_refresh_bypasses_metadata_cache(self, mocked_get):
         mocked_get.return_value = json_response(release_payload())
         self.client.get("/api/app/android/latest")
         self.client.get("/api/app/android/latest")
+        self.assertEqual(mocked_get.call_count, 2)
+
+    @patch("api.android_releases.requests.get")
+    def test_internal_cached_lookup_still_avoids_repeated_github_calls(self, mocked_get):
+        mocked_get.return_value = json_response(release_payload())
+        android_releases.get_latest_android_release()
+        android_releases.get_latest_android_release()
         self.assertEqual(mocked_get.call_count, 1)
 
     @patch("api.android_releases.get_latest_android_release")
@@ -144,6 +155,7 @@ class AndroidReleaseTests(APITestCase):
         self.assertEqual(response["Content-Type"], "application/vnd.android.package-archive")
         self.assertIn("paola-psicope.apk", response["Content-Disposition"])
         self.assertEqual(b"".join(response.streaming_content), b"abcdef")
+        mocked_latest.assert_called_once_with(force_refresh=True)
         remote.close.assert_called()
 
     @patch("api.android_releases.get_latest_android_release")

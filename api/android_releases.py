@@ -144,16 +144,19 @@ def _fetch_latest_release():
     }
 
 
-def get_latest_android_release():
+def get_latest_android_release(force_refresh=False):
     now = time.monotonic()
-    with _cache_lock:
-        if _release_cache["value"] is not None and now < _release_cache["expires_at"]:
-            return _release_cache["value"]
+    if not force_refresh:
+        with _cache_lock:
+            if _release_cache["value"] is not None and now < _release_cache["expires_at"]:
+                return _release_cache["value"]
 
     value = _fetch_latest_release()
     with _cache_lock:
         _release_cache["value"] = value
-        _release_cache["expires_at"] = now + settings.GITHUB_RELEASE_CACHE_TTL_SECONDS
+        _release_cache["expires_at"] = (
+            time.monotonic() + settings.GITHUB_RELEASE_CACHE_TTL_SECONDS
+        )
     return value
 
 
@@ -183,7 +186,13 @@ def _release_error(exc):
 @permission_classes([AllowAny])
 def android_latest_view(request):
     try:
-        return Response(_public_release(get_latest_android_release()))
+        response = Response(
+            _public_release(get_latest_android_release(force_refresh=True))
+        )
+        response["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        response["Pragma"] = "no-cache"
+        response["Expires"] = "0"
+        return response
     except (AndroidReleaseNotFound, GitHubReleaseUnavailable) as exc:
         return _release_error(exc)
 
@@ -192,7 +201,7 @@ def android_latest_view(request):
 @permission_classes([AllowAny])
 def android_download_view(request):
     try:
-        metadata = get_latest_android_release()
+        metadata = get_latest_android_release(force_refresh=True)
         remote = requests.get(
             metadata["_assetApiUrl"],
             headers=_github_headers("application/octet-stream"),

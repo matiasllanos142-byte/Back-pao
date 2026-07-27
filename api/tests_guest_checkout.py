@@ -87,6 +87,51 @@ class GuestCheckoutTests(TestCase):
         self.assertEqual(response.status_code, 400)
         self.assertEqual(Order.objects.count(), 0)
 
+    @override_settings(
+        CHECKOUT_PROMO_CODE="PAOLA10",
+        CHECKOUT_PROMO_DISCOUNT_PERCENT=10,
+    )
+    def test_mobile_checkout_returns_to_app_and_applies_promo(self):
+        response = self.client.post(
+            "/api/payments/create-preference",
+            {
+                "items": [{"productId": str(self.product.id), "quantity": 1}],
+                "customer": {
+                    "email": "familia-mobile@gmail.com",
+                    "phone": "+54 9 2324 555555",
+                },
+                "promoCode": "paola10",
+                "returnToApp": True,
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        order = Order.objects.get(id=response.data["orderId"])
+        self.assertEqual(order.customer_phone, "+54 9 2324 555555")
+        self.assertEqual(order.promo_code, "PAOLA10")
+        self.assertEqual(str(order.total), "2250.00")
+        self.assertEqual(str(order.discount_amount), "250.00")
+        self.assertEqual(order.items.get().quantity, 1)
+        self.assertEqual(str(order.items.get().price), "2250.00")
+        self.assertTrue(response.data["init_point"].startswith("paolapsicope://checkout/success"))
+        self.assertIn("guest_token=", response.data["init_point"])
+
+    def test_mobile_checkout_requires_phone(self):
+        response = self.client.post(
+            "/api/payments/create-preference",
+            {
+                "items": [{"productId": str(self.product.id), "quantity": 1}],
+                "customer": {"email": "familia-mobile@gmail.com"},
+                "returnToApp": True,
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.data["error"], "Ingresá un teléfono válido.")
+        self.assertEqual(Order.objects.count(), 0)
+
     @patch("api.email_service.send_resend_email")
     def test_guest_confirmation_email_contains_signed_download(self, mocked_send):
         mocked_send.return_value = {"sent": True, "id": "email_rendered", "reason": None}

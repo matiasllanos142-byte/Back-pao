@@ -137,6 +137,10 @@ MP_MODE = os.environ.get("MP_MODE", "auto").strip().lower()
 MP_ALLOW_UNSIGNED_WEBHOOKS_IN_DEBUG = (
     os.environ.get("MP_ALLOW_UNSIGNED_WEBHOOKS_IN_DEBUG", "False").lower() == "true"
 )
+CHECKOUT_PROMO_CODE = os.environ.get("CHECKOUT_PROMO_CODE", "").strip().upper()
+CHECKOUT_PROMO_DISCOUNT_PERCENT = int(
+    os.environ.get("CHECKOUT_PROMO_DISCOUNT_PERCENT", "0")
+)
 FRONTEND_URL = public_frontend_url(os.environ.get("FRONTEND_URL", "http://localhost:3000"))
 EMAIL_ASSETS_BASE_URL = os.environ.get("EMAIL_ASSETS_BASE_URL", "").rstrip("/")
 

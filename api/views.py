@@ -1,6 +1,7 @@
 import os
 import json
 import hashlib
+import re
 import time
 import base64
 import secrets
@@ -2344,6 +2345,9 @@ def create_payment_preference_view(request):
     user = request.user if request.user.is_authenticated else None
     customer_email = (user.email if user else customer.get("email", "")).lower().strip()
     customer_name = customer.get("name", "").strip() or (user.first_name if user else "")
+    customer_phone = str(customer.get("phone", "")).strip()
+    promo_code = str(request.data.get("promoCode", "")).strip().upper()
+    return_to_app = request.data.get("returnToApp") is True
 
     try:
         validate_email(customer_email)
@@ -2356,6 +2360,23 @@ def create_payment_preference_view(request):
     if not customer_name:
         customer_name = customer_email.split("@", 1)[0].replace(".", " ").strip().title() or "Cliente"
 
+    if return_to_app and len(re.sub(r"\D", "", customer_phone)) < 8:
+        return Response(
+            {"error": "Ingresá un teléfono válido."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    promo_discount_percent = Decimal("0")
+    if promo_code:
+        configured_code = str(settings.CHECKOUT_PROMO_CODE or "").strip().upper()
+        configured_percent = max(0, min(100, int(settings.CHECKOUT_PROMO_DISCOUNT_PERCENT or 0)))
+        if not configured_code or promo_code != configured_code or configured_percent <= 0:
+            return Response(
+                {"error": "El código promocional no es válido."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        promo_discount_percent = Decimal(configured_percent)
+
     if not items_data or not customer_name or not customer_email:
         return Response({"error": "Datos incompletos."}, status=status.HTTP_400_BAD_REQUEST)
 
@@ -2366,7 +2387,9 @@ def create_payment_preference_view(request):
             quantity = int(item.get("quantity", 1))
             if quantity < 1:
                 raise ValueError
-            order_items.append({"product": product, "quantity": quantity})
+            discount_multiplier = (Decimal("100") - promo_discount_percent) / Decimal("100")
+            unit_price = (product.price * discount_multiplier).quantize(Decimal("0.01"))
+            order_items.append({"product": product, "quantity": quantity, "unit_price": unit_price})
         except (Product.DoesNotExist, ValueError, KeyError):
             return Response({"error": f"Item inválido: {item}"}, status=status.HTTP_400_BAD_REQUEST)
 
@@ -2384,7 +2407,9 @@ def create_payment_preference_view(request):
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR,
             )
 
-    total = sum(item["product"].price * item["quantity"] for item in order_items)
+    subtotal = sum(item["product"].price * item["quantity"] for item in order_items)
+    total = sum(item["unit_price"] * item["quantity"] for item in order_items)
+    discount_amount = subtotal - total
 
     order = Order.objects.create(
         user=user,
@@ -2392,6 +2417,9 @@ def create_payment_preference_view(request):
         status="completada" if not settings.MP_ACCESS_TOKEN else "pendiente",
         customer_name=customer_name,
         customer_email=customer_email,
+        customer_phone=customer_phone,
+        promo_code=promo_code,
+        discount_amount=discount_amount,
         external_reference="",
     )
     order.external_reference = str(order.id)
@@ -2403,16 +2431,23 @@ def create_payment_preference_view(request):
             order=order,
             product=item["product"],
             quantity=item["quantity"],
-            price=item["product"].price,
+            price=item["unit_price"],
         )
+
+    def checkout_return_url(result):
+        guest_query = f"&guest_token={guest_token}" if guest_token else ""
+        if return_to_app:
+            return f"paolapsicope://checkout/{result}?order_id={order.id}{guest_query}"
+        return f"{base_url}/checkout/{result}?order_id={order.id}{guest_query}"
 
     if not settings.MP_ACCESS_TOKEN:
         grant_order_access(order)
         return Response({
             "demo": True,
             "orderId": str(order.id),
-            "init_point": f"{base_url}/checkout/success?order_id={order.id}" + (f"&guest_token={guest_token}" if guest_token else ""),
+            "init_point": checkout_return_url("success"),
             "guestToken": guest_token or None,
+            "discountAmount": str(discount_amount),
         })
 
     mercado_pago_mode = get_mercado_pago_mode()
@@ -2434,14 +2469,12 @@ def create_payment_preference_view(request):
     notification_url = get_payment_notification_url(request)
     _record_event(user, "checkout_started", "order", order.id)
 
-    guest_query = f"&guest_token={guest_token}" if guest_token else ""
-
     preference_payload = {
         "items": [
             {
                 "id": str(item["product"].id),
                 "title": item["product"].title,
-                "unit_price": float(item["product"].price),
+                "unit_price": float(item["unit_price"]),
                 "quantity": item["quantity"],
                 "currency_id": "ARS",
             }
@@ -2449,9 +2482,9 @@ def create_payment_preference_view(request):
         ],
         "payer": {"name": customer_name, "email": customer_email},
         "back_urls": {
-            "success": f"{base_url}/checkout/success?order_id={order.id}{guest_query}",
-            "failure": f"{base_url}/checkout/failure?order_id={order.id}{guest_query}",
-            "pending": f"{base_url}/checkout/pending?order_id={order.id}{guest_query}",
+            "success": checkout_return_url("success"),
+            "failure": checkout_return_url("failure"),
+            "pending": checkout_return_url("pending"),
         },
         "auto_return": "approved",
         "external_reference": str(order.id),
@@ -2520,6 +2553,7 @@ def create_payment_preference_view(request):
         "notificationUrl": notification_url,
         "mpMode": mercado_pago_mode,
         "guestToken": guest_token or None,
+        "discountAmount": str(discount_amount),
     })
 
 
