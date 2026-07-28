@@ -13,6 +13,7 @@ logger = logging.getLogger(__name__)
 
 EMAIL_VERIFICATION_SALT = "paola-psicope.email-verification"
 GUEST_ORDER_SALT = "paola-psicope.guest-order"
+CHECKOUT_RETURN_SALT = "paola-psicope.checkout-return"
 
 
 class EmailDeliveryError(Exception):
@@ -49,8 +50,31 @@ def read_guest_order_token(token):
     )
 
 
+def make_checkout_return_token(order):
+    return signing.dumps(
+        {
+            "order_id": str(order.id),
+            "email": order.customer_email.lower(),
+            "user_id": str(order.user_id) if order.user_id else "",
+        },
+        salt=CHECKOUT_RETURN_SALT,
+    )
+
+
+def read_checkout_return_token(token):
+    return signing.loads(
+        token,
+        salt=CHECKOUT_RETURN_SALT,
+        max_age=getattr(
+            settings,
+            "CHECKOUT_RETURN_TOKEN_TTL_SECONDS",
+            60 * 60 * 24 * 30,
+        ),
+    )
+
+
 def build_guest_download_url(order, product):
-    token = quote(make_guest_order_token(order), safe="")
+    token = quote(make_checkout_return_token(order), safe="")
     path = f"/api/orders/{order.id}/downloads/{product.id}?token={token}"
     if settings.BACKEND_PUBLIC_URL:
         return f"{settings.BACKEND_PUBLIC_URL.rstrip('/')}{path}"
@@ -238,7 +262,7 @@ def send_purchase_confirmation_email(order, notification=None):
             "url": build_guest_download_url(order, item.product),
         }
         for item in items
-        if is_guest and item.product.download_url
+        if item.product.download_url
     ]
     order_url = download_links[0]["url"] if download_links else build_frontend_url("/perfil#biblioteca")
 
@@ -306,6 +330,30 @@ def send_registration_code_email(name, email, code):
             "html": rendered["html"],
             "text": rendered["text"],
             "notificationType": "verify_account",
+        }
+    )
+
+
+def send_access_code_email(name, email, code):
+    expires_minutes = (
+        int(settings.EMAIL_VERIFICATION_CODE_TTL_SECONDS / 60)
+        if hasattr(settings, "EMAIL_VERIFICATION_CODE_TTL_SECONDS")
+        else 10
+    )
+    rendered = render_email_template("verify_account", {
+        "name": name or "familia",
+        "code": code,
+        "expires_minutes": str(expires_minutes),
+        "subject": f"Tu código para ingresar es {code}",
+    })
+
+    return send_resend_email(
+        {
+            "to": email,
+            "subject": rendered["subject"],
+            "html": rendered["html"],
+            "text": rendered["text"],
+            "notificationType": "access_code",
         }
     )
 

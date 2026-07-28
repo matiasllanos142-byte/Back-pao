@@ -4,7 +4,16 @@ from django.utils.text import slugify
 from rest_framework import serializers
 from django.contrib.auth import get_user_model
 from django.contrib.auth.hashers import make_password
-from .models import Category, Notification, Order, OrderItem, Product, PurchasedProduct, UserEvent
+from .models import (
+    Category,
+    Coupon,
+    Notification,
+    Order,
+    OrderItem,
+    Product,
+    PurchasedProduct,
+    UserEvent,
+)
 
 User = get_user_model()
 
@@ -290,6 +299,59 @@ class ProductListSerializer(serializers.ModelSerializer):
                 })
         sanitized.sort(key=lambda x: x["order"])
         return sanitized
+
+
+class CouponSerializer(serializers.ModelSerializer):
+    code = serializers.CharField(max_length=80)
+    usesRemaining = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Coupon
+        fields = [
+            "id",
+            "code",
+            "discount_percent",
+            "is_active",
+            "starts_at",
+            "expires_at",
+            "max_uses",
+            "used_count",
+            "usesRemaining",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = ["id", "used_count", "usesRemaining", "created_at", "updated_at"]
+
+    def validate_code(self, value):
+        normalized = str(value or "").strip().upper()
+        if len(normalized) < 3:
+            raise serializers.ValidationError("El codigo debe tener al menos 3 caracteres.")
+        return normalized
+
+    def validate_max_uses(self, value):
+        if value is not None and value < 1:
+            raise serializers.ValidationError("El limite de usos debe ser mayor a cero.")
+        return value
+
+    def validate(self, attrs):
+        starts_at = attrs.get("starts_at", getattr(self.instance, "starts_at", None))
+        expires_at = attrs.get("expires_at", getattr(self.instance, "expires_at", None))
+        if starts_at and expires_at and expires_at <= starts_at:
+            raise serializers.ValidationError(
+                {"expires_at": "El vencimiento debe ser posterior al inicio."}
+            )
+        max_uses = attrs.get("max_uses", getattr(self.instance, "max_uses", None))
+        used_count = getattr(self.instance, "used_count", 0)
+        if max_uses is not None and max_uses < used_count:
+            raise serializers.ValidationError(
+                {"max_uses": "El limite no puede ser menor que los usos ya registrados."}
+            )
+        return attrs
+
+    def get_usesRemaining(self, obj):
+        if obj.max_uses is None:
+            return None
+        return max(obj.max_uses - obj.used_count, 0)
 
 
 class PurchasedProductSerializer(serializers.ModelSerializer):

@@ -25,7 +25,7 @@ from django.core import signing
 from django.core.exceptions import ValidationError
 from django.core.validators import validate_email
 from django.db import transaction
-from django.db.models import Count, DecimalField, IntegerField, OuterRef, Q, Subquery, Sum, Value
+from django.db.models import Count, DecimalField, F, IntegerField, OuterRef, Q, Subquery, Sum, Value
 from django.db.models.functions import Coalesce
 from django.http import HttpResponse
 from django.shortcuts import redirect
@@ -38,6 +38,7 @@ logger = logging.getLogger(__name__)
 
 from .models import (
     Category,
+    Coupon,
     NvidiaSettings,
     Notification,
     Order,
@@ -58,6 +59,7 @@ from .serializers import (
     UserSerializer,
     RegisterSerializer,
     CategorySerializer,
+    CouponSerializer,
     ProductSerializer,
     ProductListSerializer,
     PurchasedProductSerializer,
@@ -75,10 +77,12 @@ from .admin_auth import (
 )
 from .email_service import (
     EmailDeliveryError,
-    make_guest_order_token,
+    make_checkout_return_token,
+    read_checkout_return_token,
     read_guest_order_token,
     read_email_verification_token,
     send_abandoned_cart_email,
+    send_access_code_email,
     send_download_help_email,
     send_download_ready_email,
     send_new_product_email,
@@ -186,6 +190,179 @@ def format_email_delivery_error(exc):
             "al email dueño de la cuenta de Resend. Para enviar a otros emails hay que verificar un dominio."
         )
     return message
+
+
+def _normalized_email(value):
+    email = str(value or "").lower().strip()
+    try:
+        validate_email(email)
+    except ValidationError:
+        return ""
+    return email
+
+
+def _name_from_email(email):
+    local_part = email.split("@", 1)[0]
+    normalized = re.sub(r"[._+-]+", " ", local_part).strip()
+    return normalized.title() or "Familia"
+
+
+@api_view(["POST"])
+@permission_classes([AllowAny])
+def request_email_access_code_view(request):
+    email = _normalized_email(request.data.get("email"))
+    if not email:
+        return Response({"error": "Ingresa un email valido."}, status=status.HTTP_400_BAD_REQUEST)
+
+    existing_user = User.objects.filter(email=email).first()
+    if existing_user and (not existing_user.is_active or existing_user.disabled_at is not None):
+        return Response({"error": "La cuenta esta deshabilitada."}, status=status.HTTP_403_FORBIDDEN)
+
+    pending = PendingRegistration.objects.filter(email=email).first()
+    cooldown_seconds = settings.EMAIL_ACCESS_CODE_RESEND_COOLDOWN_SECONDS
+    if pending and not pending.is_expired():
+        elapsed = (timezone.now() - pending.updated_at).total_seconds()
+        if elapsed < cooldown_seconds:
+            retry_after = max(int(cooldown_seconds - elapsed) + 1, 1)
+            return Response(
+                {
+                    "error": f"Espera {retry_after} segundos antes de pedir otro codigo.",
+                    "retryAfterSeconds": retry_after,
+                },
+                status=status.HTTP_429_TOO_MANY_REQUESTS,
+            )
+
+    name = (
+        existing_user.first_name
+        if existing_user and existing_user.first_name
+        else _name_from_email(email)
+    )
+    code = make_registration_code()
+    try:
+        send_access_code_email(name, email, code)
+    except EmailDeliveryError as exc:
+        return Response(
+            {
+                "error": format_email_delivery_error(exc),
+                "emailVerificationSent": False,
+            },
+            status=status.HTTP_502_BAD_GATEWAY,
+        )
+
+    PendingRegistration.objects.update_or_create(
+        email=email,
+        defaults={
+            "name": name,
+            "password_hash": "",
+            "verification_code_hash": make_password(code),
+            "attempts": 0,
+            "expires_at": pending_registration_expires_at(),
+        },
+    )
+    return Response(
+        {
+            "email": email,
+            "emailVerificationRequired": True,
+            "emailVerificationSent": True,
+            "expiresInSeconds": settings.EMAIL_VERIFICATION_CODE_TTL_SECONDS,
+        },
+        status=status.HTTP_202_ACCEPTED,
+    )
+
+
+@api_view(["POST"])
+@permission_classes([AllowAny])
+def verify_email_access_code_view(request):
+    email = _normalized_email(request.data.get("email"))
+    code = str(request.data.get("code") or "").strip()
+    if not email or not re.fullmatch(r"\d{6}", code):
+        return Response(
+            {"error": "Email y codigo de seis digitos son obligatorios."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    try:
+        pending = PendingRegistration.objects.get(email=email)
+    except PendingRegistration.DoesNotExist:
+        return Response(
+            {"error": "No hay un codigo pendiente para este email. Pedi uno nuevo."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    if pending.is_expired():
+        pending.delete()
+        return Response(
+            {"error": "El codigo vencio. Pedi uno nuevo para continuar."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    max_attempts = settings.EMAIL_VERIFICATION_CODE_MAX_ATTEMPTS
+    if pending.attempts >= max_attempts:
+        pending.delete()
+        return Response(
+            {"error": "Se supero el limite de intentos. Pedi un nuevo codigo."},
+            status=status.HTTP_429_TOO_MANY_REQUESTS,
+        )
+
+    if not check_password(code, pending.verification_code_hash):
+        pending.attempts += 1
+        pending.save(update_fields=["attempts", "updated_at"])
+        remaining = max(max_attempts - pending.attempts, 0)
+        return Response(
+            {"error": "Codigo incorrecto.", "attemptsRemaining": remaining},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    with transaction.atomic():
+        user = User.objects.select_for_update().filter(email=email).first()
+        created = user is None
+        email_verified_now = created
+        if created:
+            user = User(
+                username=email,
+                email=email,
+                first_name=pending.name or _name_from_email(email),
+                is_admin=False,
+                email_verified=True,
+                email_verified_at=timezone.now(),
+            )
+            user.set_unusable_password()
+            user.save()
+            _record_event(user, "account_registered", "user", user.id)
+        elif not user.is_active or user.disabled_at is not None:
+            pending.delete()
+            return Response(
+                {"error": "La cuenta esta deshabilitada."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+        elif not user.email_verified:
+            user.email_verified = True
+            user.email_verified_at = timezone.now()
+            email_verified_now = True
+
+        user.last_login = timezone.now()
+        update_fields = ["last_login", "updated_at"]
+        if not created and email_verified_now:
+            update_fields.extend(["email_verified", "email_verified_at"])
+        if not created:
+            user.save(update_fields=list(dict.fromkeys(update_fields)))
+
+        pending.delete()
+        if email_verified_now:
+            _record_event(user, "email_verified", "user", user.id)
+        _record_event(user, "login")
+
+    token = make_auth_token(user)
+    response_status = status.HTTP_201_CREATED if created else status.HTTP_200_OK
+    response = Response(
+        {
+            "user": UserSerializer(user).data,
+            "accessToken": token,
+            "accountCreated": created,
+        },
+        status=response_status,
+    )
+    return set_auth_cookie(response, user, token)
 
 
 @api_view(["POST"])
@@ -2177,6 +2354,43 @@ def admin_order_detail_view(request, pk):
     return Response({"order": data})
 
 
+@api_view(["GET", "POST"])
+@permission_classes([IsEnvAdmin])
+def admin_coupon_list_create_view(request):
+    if request.method == "GET":
+        coupons = Coupon.objects.all().order_by("-created_at")
+        return Response({"coupons": CouponSerializer(coupons, many=True).data})
+
+    serializer = CouponSerializer(data=request.data)
+    if not serializer.is_valid():
+        return Response({"error": serializer.errors}, status=status.HTTP_400_BAD_REQUEST)
+    coupon = serializer.save()
+    return Response(
+        {"coupon": CouponSerializer(coupon).data},
+        status=status.HTTP_201_CREATED,
+    )
+
+
+@api_view(["PATCH", "DELETE"])
+@permission_classes([IsEnvAdmin])
+def admin_coupon_detail_view(request, pk):
+    coupon = get_object_or_404(Coupon, pk=pk)
+    if request.method == "PATCH":
+        serializer = CouponSerializer(coupon, data=request.data, partial=True)
+        if not serializer.is_valid():
+            return Response({"error": serializer.errors}, status=status.HTTP_400_BAD_REQUEST)
+        coupon = serializer.save()
+        return Response({"coupon": CouponSerializer(coupon).data})
+
+    if coupon.orders.exists():
+        coupon.is_active = False
+        coupon.save(update_fields=["is_active", "updated_at"])
+        return Response({"ok": True, "archived": True})
+
+    coupon.delete()
+    return Response(status=status.HTTP_204_NO_CONTENT)
+
+
 @api_view(["GET"])
 @permission_classes([IsEnvAdmin])
 def admin_files_view(request):
@@ -2334,7 +2548,12 @@ def order_detail_view(request, pk):
     order = get_object_or_404(Order, pk=pk)
     if not request.user.is_admin and order.customer_email != request.user.email:
         return Response({"error": "No autorizado."}, status=status.HTTP_403_FORBIDDEN)
-    return Response({"order": OrderSerializer(order).data})
+    latest_email = order.notifications.filter(type="purchase_confirmed").order_by("-created_at").first()
+    return Response({
+        "order": OrderSerializer(order).data,
+        "isGuest": order.user_id is None,
+        "emailStatus": latest_email.status if latest_email else None,
+    })
 
 
 @api_view(["POST"])
@@ -2367,7 +2586,23 @@ def create_payment_preference_view(request):
         )
 
     promo_discount_percent = Decimal("0")
-    if promo_code:
+    coupon = Coupon.objects.filter(code=promo_code).first() if promo_code else None
+    if coupon:
+        now = timezone.now()
+        coupon_is_available = (
+            coupon.is_active
+            and (coupon.starts_at is None or coupon.starts_at <= now)
+            and (coupon.expires_at is None or coupon.expires_at > now)
+            and (coupon.max_uses is None or coupon.used_count < coupon.max_uses)
+        )
+        if not coupon_is_available:
+            return Response(
+                {"error": "El codigo promocional no esta disponible."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        promo_discount_percent = Decimal(coupon.discount_percent)
+
+    if promo_code and not coupon:
         configured_code = str(settings.CHECKOUT_PROMO_CODE or "").strip().upper()
         configured_percent = max(0, min(100, int(settings.CHECKOUT_PROMO_DISCOUNT_PERCENT or 0)))
         if not configured_code or promo_code != configured_code or configured_percent <= 0:
@@ -2414,17 +2649,18 @@ def create_payment_preference_view(request):
     order = Order.objects.create(
         user=user,
         total=total,
-        status="completada" if not settings.MP_ACCESS_TOKEN else "pendiente",
+        status="pendiente",
         customer_name=customer_name,
         customer_email=customer_email,
         customer_phone=customer_phone,
         promo_code=promo_code,
         discount_amount=discount_amount,
+        coupon=coupon,
         external_reference="",
     )
     order.external_reference = str(order.id)
     order.save(update_fields=["external_reference", "updated_at"])
-    guest_token = make_guest_order_token(order) if not user else ""
+    checkout_token = make_checkout_return_token(order)
 
     for item in order_items:
         OrderItem.objects.create(
@@ -2435,18 +2671,51 @@ def create_payment_preference_view(request):
         )
 
     def checkout_return_url(result):
-        guest_query = f"&guest_token={guest_token}" if guest_token else ""
+        token_query = f"&checkout_token={checkout_token}"
+        if not user:
+            token_query += f"&guest_token={checkout_token}"
         if return_to_app:
-            return f"paolapsicope://checkout/{result}?order_id={order.id}{guest_query}"
-        return f"{base_url}/checkout/{result}?order_id={order.id}{guest_query}"
+            return f"paolapsicope://checkout/{result}?order_id={order.id}{token_query}"
+        return f"{base_url}/checkout/{result}?order_id={order.id}{token_query}"
 
-    if not settings.MP_ACCESS_TOKEN:
-        grant_order_access(order)
+    if total == 0 or not settings.MP_ACCESS_TOKEN:
+        provider = "coupon" if total == 0 and promo_code else "internal"
+        provider_payment_id = f"{provider}-{order.id}"
+        with transaction.atomic():
+            Payment.objects.update_or_create(
+                provider_payment_id=provider_payment_id,
+                defaults={
+                    "order": order,
+                    "provider": provider,
+                    "preference_id": "",
+                    "status": "approved",
+                    "status_detail": (
+                        "100_percent_discount"
+                        if provider == "coupon"
+                        else "payment_provider_disabled"
+                    ),
+                    "amount": total,
+                    "currency": "ARS",
+                    "payer_email": customer_email,
+                    "approved_at": timezone.now(),
+                    "raw_metadata": {
+                        "promo_code": promo_code,
+                        "discount_amount": str(discount_amount),
+                    },
+                },
+            )
+            notification = _complete_order(
+                order,
+                {"id": provider_payment_id, "provider": provider},
+            )
+        _deliver_purchase_notification(order, notification)
         return Response({
-            "demo": True,
+            "demo": not settings.MP_ACCESS_TOKEN,
+            "complimentary": total == 0,
             "orderId": str(order.id),
             "init_point": checkout_return_url("success"),
-            "guestToken": guest_token or None,
+            "checkoutToken": checkout_token,
+            "guestToken": checkout_token if not user else None,
             "discountAmount": str(discount_amount),
         })
 
@@ -2552,7 +2821,8 @@ def create_payment_preference_view(request):
         "preferenceId": order.preference_id,
         "notificationUrl": notification_url,
         "mpMode": mercado_pago_mode,
-        "guestToken": guest_token or None,
+        "checkoutToken": checkout_token,
+        "guestToken": checkout_token if not user else None,
         "discountAmount": str(discount_amount),
     })
 
@@ -2584,14 +2854,15 @@ def _deliver_purchase_notification(order, notification):
     except EmailDeliveryError:
         pass
 
-    send_push_to_user(
-        order.user,
-        title="Tu compra ya esta disponible",
-        body="Ya podes abrir tus recursos desde la biblioteca de Paola Psicope.",
-        data={"target": "resources", "orderId": str(order.id)},
-        notification_type="purchase_confirmed_push",
-        order=order,
-    )
+    if order.user_id:
+        send_push_to_user(
+            order.user,
+            title="Tu compra ya esta disponible",
+            body="Ya podes abrir tus recursos desde la biblioteca de Paola Psicope.",
+            data={"target": "resources", "orderId": str(order.id)},
+            notification_type="purchase_confirmed_push",
+            order=order,
+        )
 
 
 @api_view(["POST", "DELETE"])
@@ -2682,6 +2953,12 @@ def _complete_order(order, payment_data):
     order.paid_at = now
     order.save(update_fields=["status", "payment_id", "paid_at", "updated_at"])
 
+    if order.coupon_id:
+        Coupon.objects.filter(id=order.coupon_id).update(
+            used_count=F("used_count") + 1,
+            updated_at=now,
+        )
+
     if order.user_id:
         for item in order.items.select_related("product"):
             PurchasedProduct.objects.update_or_create(
@@ -2700,14 +2977,17 @@ def _complete_order(order, payment_data):
     )
 
 
-def _guest_order_from_token(pk, token):
+def _order_from_checkout_token(pk, token):
     try:
-        payload = read_guest_order_token(token)
+        payload = read_checkout_return_token(token)
     except signing.BadSignature:
-        return None
+        try:
+            payload = read_guest_order_token(token)
+        except signing.BadSignature:
+            return None
     if str(payload.get("order_id")) != str(pk):
         return None
-    order = Order.objects.filter(pk=pk, user__isnull=True).first()
+    order = Order.objects.filter(pk=pk).first()
     if not order or payload.get("email", "").lower() != order.customer_email.lower():
         return None
     return order
@@ -2716,16 +2996,21 @@ def _guest_order_from_token(pk, token):
 @api_view(["GET"])
 @permission_classes([AllowAny])
 def guest_order_detail_view(request, pk):
-    order = _guest_order_from_token(pk, request.query_params.get("token", ""))
+    order = _order_from_checkout_token(pk, request.query_params.get("token", ""))
     if not order:
         return Response({"error": "Enlace inválido o vencido."}, status=status.HTTP_403_FORBIDDEN)
-    return Response({"order": OrderSerializer(order).data})
+    latest_email = order.notifications.filter(type="purchase_confirmed").order_by("-created_at").first()
+    return Response({
+        "order": OrderSerializer(order).data,
+        "isGuest": order.user_id is None,
+        "emailStatus": latest_email.status if latest_email else None,
+    })
 
 
 @api_view(["GET"])
 @permission_classes([AllowAny])
 def guest_order_download_view(request, pk, product_pk):
-    order = _guest_order_from_token(pk, request.query_params.get("token", ""))
+    order = _order_from_checkout_token(pk, request.query_params.get("token", ""))
     if not order or order.status != "completada":
         return Response({"error": "Descarga no disponible."}, status=status.HTTP_403_FORBIDDEN)
     item = get_object_or_404(order.items.select_related("product"), product_id=product_pk)

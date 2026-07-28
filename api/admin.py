@@ -4,6 +4,7 @@ from .models import (
     User,
     Category,
     Product,
+    Coupon,
     Order,
     OrderItem,
     CloudinarySettings,
@@ -43,6 +44,22 @@ class ProductAdmin(admin.ModelAdmin):
     list_display = ["title", "product_type", "category", "price", "compare_at_price", "featured", "is_active", "created_at"]
     list_filter = ["product_type", "category", "featured", "is_active", "level"]
     search_fields = ["title", "description"]
+
+
+@admin.register(Coupon)
+class CouponAdmin(admin.ModelAdmin):
+    list_display = [
+        "code",
+        "discount_percent",
+        "is_active",
+        "used_count",
+        "max_uses",
+        "expires_at",
+        "created_at",
+    ]
+    list_filter = ["is_active", "discount_percent", "created_at"]
+    search_fields = ["code"]
+    readonly_fields = ["used_count", "created_at", "updated_at"]
 
 
 @admin.register(CloudinarySettings)

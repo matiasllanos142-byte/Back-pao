@@ -964,17 +964,20 @@ class AdminAuthTests(TestCase):
         self.assertEqual(payload["items"][0]["title"], "Cuadernillo MP")
         self.assertNotIn("body", payload)
         self.assertEqual(payload["external_reference"], str(order.id))
-        self.assertEqual(
-            payload["back_urls"]["success"],
-            f"https://workenginecorp.com.ar/checkout/success?order_id={order.id}",
+        self.assertTrue(
+            payload["back_urls"]["success"].startswith(
+                f"https://workenginecorp.com.ar/checkout/success?order_id={order.id}&checkout_token="
+            )
         )
-        self.assertEqual(
-            payload["back_urls"]["failure"],
-            f"https://workenginecorp.com.ar/checkout/failure?order_id={order.id}",
+        self.assertTrue(
+            payload["back_urls"]["failure"].startswith(
+                f"https://workenginecorp.com.ar/checkout/failure?order_id={order.id}&checkout_token="
+            )
         )
-        self.assertEqual(
-            payload["back_urls"]["pending"],
-            f"https://workenginecorp.com.ar/checkout/pending?order_id={order.id}",
+        self.assertTrue(
+            payload["back_urls"]["pending"].startswith(
+                f"https://workenginecorp.com.ar/checkout/pending?order_id={order.id}&checkout_token="
+            )
         )
 
     @override_settings(

@@ -1,5 +1,6 @@
 import uuid
 from django.contrib.auth.models import AbstractUser
+from django.core.validators import MaxValueValidator, MinValueValidator
 from django.db import models
 from django.utils import timezone
 
@@ -424,6 +425,32 @@ class PurchasedProduct(models.Model):
         return f"{self.user.email} -> {self.product.title}"
 
 
+class Coupon(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    code = models.CharField(max_length=80, unique=True)
+    discount_percent = models.PositiveSmallIntegerField(
+        validators=[MinValueValidator(1), MaxValueValidator(100)]
+    )
+    is_active = models.BooleanField(default=True)
+    starts_at = models.DateTimeField(blank=True, null=True)
+    expires_at = models.DateTimeField(blank=True, null=True)
+    max_uses = models.PositiveIntegerField(blank=True, null=True)
+    used_count = models.PositiveIntegerField(default=0)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "coupons"
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["code", "is_active"]),
+            models.Index(fields=["expires_at"]),
+        ]
+
+    def __str__(self):
+        return f"{self.code} ({self.discount_percent}%)"
+
+
 class Order(models.Model):
     STATUS_CHOICES = [
         ("pendiente", "Pendiente"),
@@ -443,6 +470,13 @@ class Order(models.Model):
     customer_phone = models.CharField(max_length=50, blank=True)
     promo_code = models.CharField(max_length=80, blank=True)
     discount_amount = models.DecimalField(max_digits=10, decimal_places=2, default=0)
+    coupon = models.ForeignKey(
+        Coupon,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="orders",
+    )
     preference_id = models.CharField(max_length=200, blank=True, null=True)
     payment_id = models.CharField(max_length=200, blank=True, null=True)
     external_reference = models.CharField(max_length=200, blank=True, null=True)
